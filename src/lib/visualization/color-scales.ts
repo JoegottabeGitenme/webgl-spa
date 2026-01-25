@@ -392,6 +392,131 @@ export function applyColormapToImageData(
 }
 
 /**
+ * Apply a colormap to grayscale image data with stepped/quantized colors
+ * Creates discrete color bands instead of smooth gradients
+ * 
+ * @param grayscaleData - RGBA image data (only R channel is used)
+ * @param scale - The color scale to use
+ * @param steps - Number of discrete color steps
+ * @param alpha - Alpha value (0-255) or function that takes normalized value (0-1) and returns alpha (0-255)
+ * @returns New Uint8ClampedArray with stepped colormap applied
+ */
+export function applySteppedColormapToImageData(
+  grayscaleData: Uint8ClampedArray,
+  scale: ColorScale,
+  steps: number,
+  alpha: number | ((normalizedValue: number) => number) = 200
+): Uint8ClampedArray {
+  const output = new Uint8ClampedArray(grayscaleData.length);
+
+  for (let i = 0; i < grayscaleData.length; i += 4) {
+    // Normalize grayscale value from R channel (0-255) to 0-1
+    const normalizedValue = grayscaleData[i] / 255;
+    
+    // Quantize to discrete steps (floor to get step boundaries that align with contour lines)
+    const stepSize = 1 / steps;
+    const quantizedValue = Math.floor(normalizedValue / stepSize) * stepSize + stepSize / 2;
+    const clampedValue = Math.min(Math.max(quantizedValue, 0), 1);
+    
+    const [r, g, b] = getColorForValue(clampedValue, scale);
+
+    output[i] = r; // R
+    output[i + 1] = g; // G
+    output[i + 2] = b; // B
+    
+    // Support both fixed alpha and alpha function
+    output[i + 3] = typeof alpha === 'function' 
+      ? alpha(normalizedValue) 
+      : alpha;
+  }
+
+  return output;
+}
+
+/**
+ * Apply a colormap with stepped colors that align exactly with contour levels
+ * Each region between contour lines gets a single solid color
+ * 
+ * @param grayscaleData - RGBA image data (only R channel is used)
+ * @param scale - The color scale to use
+ * @param levels - Array of contour levels in data units (e.g., Kelvin for temperature)
+ * @param dataMin - Minimum data value (maps to pixel value 0)
+ * @param dataMax - Maximum data value (maps to pixel value 255)
+ * @param alpha - Alpha value (0-255) or function
+ * @returns New Uint8ClampedArray with stepped colormap applied
+ */
+export function applySteppedColormapWithLevels(
+  grayscaleData: Uint8ClampedArray,
+  scale: ColorScale,
+  levels: number[],
+  dataMin: number,
+  dataMax: number,
+  alpha: number | ((normalizedValue: number) => number) = 200
+): Uint8ClampedArray {
+  const output = new Uint8ClampedArray(grayscaleData.length);
+  const dataRange = dataMax - dataMin;
+  
+  // Sort levels to ensure they're in ascending order
+  const sortedLevels = [...levels].sort((a, b) => a - b);
+  
+  // Pre-calculate normalized level positions (0-1 scale for color lookup)
+  // Also calculate the midpoint of each band for color selection
+  const bandColors: [number, number, number][] = [];
+  
+  // Band below first level
+  if (sortedLevels.length > 0) {
+    const firstLevelNorm = (sortedLevels[0] - dataMin) / dataRange;
+    const belowMid = Math.max(0, firstLevelNorm / 2);
+    bandColors.push(getColorForValue(belowMid, scale));
+  }
+  
+  // Bands between levels
+  for (let i = 0; i < sortedLevels.length - 1; i++) {
+    const lowNorm = (sortedLevels[i] - dataMin) / dataRange;
+    const highNorm = (sortedLevels[i + 1] - dataMin) / dataRange;
+    const midNorm = (lowNorm + highNorm) / 2;
+    bandColors.push(getColorForValue(Math.min(1, Math.max(0, midNorm)), scale));
+  }
+  
+  // Band above last level
+  if (sortedLevels.length > 0) {
+    const lastLevelNorm = (sortedLevels[sortedLevels.length - 1] - dataMin) / dataRange;
+    const aboveMid = Math.min(1, (lastLevelNorm + 1) / 2);
+    bandColors.push(getColorForValue(aboveMid, scale));
+  }
+
+  for (let i = 0; i < grayscaleData.length; i += 4) {
+    // Convert pixel value to data value
+    const pixelValue = grayscaleData[i];
+    const dataValue = dataMin + (pixelValue / 255) * dataRange;
+    const normalizedValue = pixelValue / 255;
+    
+    // Find which band this value falls into
+    let bandIndex = 0;
+    for (let j = 0; j < sortedLevels.length; j++) {
+      if (dataValue >= sortedLevels[j]) {
+        bandIndex = j + 1;
+      } else {
+        break;
+      }
+    }
+    
+    // Get the pre-calculated color for this band
+    const [r, g, b] = bandColors[Math.min(bandIndex, bandColors.length - 1)] || [128, 128, 128];
+
+    output[i] = r;
+    output[i + 1] = g;
+    output[i + 2] = b;
+    
+    output[i + 3] = typeof alpha === 'function' 
+      ? alpha(normalizedValue) 
+      : alpha;
+  }
+
+  return output;
+}
+
+/**
  * Alpha function for radar data - makes low values transparent
  * 
  * This prevents the black/dark areas (no precipitation) from obscuring the map.
@@ -412,4 +537,157 @@ export function radarAlphaFunction(normalizedValue: number): number {
   
   // Full opacity for higher values
   return 200;
+}
+
+/**
+ * Absolute temperature ranges for color scale mapping
+ * These define the full range of the color scale (position 0-1)
+ */
+export const ABSOLUTE_TEMP_RANGES = {
+  F: { min: -60, max: 130 },  // -60°F to 130°F
+  C: { min: -51, max: 54 },   // ~-51°C to ~54°C (equivalent)
+};
+
+/**
+ * Apply a colormap using absolute temperature mapping
+ * 
+ * This maps pixel values to actual temperatures, then to positions on an
+ * absolute temperature scale, ensuring the color scale is consistent
+ * regardless of the data range.
+ * 
+ * @param grayscaleData - RGBA image data (only R channel is used)
+ * @param scale - The color scale to use
+ * @param dataMin - Data minimum in Kelvin
+ * @param dataMax - Data maximum in Kelvin
+ * @param unit - Temperature display unit ('F' or 'C')
+ * @param alpha - Alpha value or function
+ * @returns New Uint8ClampedArray with colormap applied
+ */
+export function applyColormapWithAbsoluteTemp(
+  grayscaleData: Uint8ClampedArray,
+  scale: ColorScale,
+  dataMin: number,
+  dataMax: number,
+  unit: 'F' | 'C' = 'F',
+  alpha: number | ((normalizedValue: number) => number) = 200
+): Uint8ClampedArray {
+  const output = new Uint8ClampedArray(grayscaleData.length);
+  const dataRange = dataMax - dataMin;
+  const absRange = ABSOLUTE_TEMP_RANGES[unit];
+  const absRangeSize = absRange.max - absRange.min;
+
+  for (let i = 0; i < grayscaleData.length; i += 4) {
+    // Get pixel value and convert to data value (Kelvin)
+    const pixelValue = grayscaleData[i];
+    const kelvin = dataMin + (pixelValue / 255) * dataRange;
+    
+    // Convert Kelvin to display temperature
+    const displayTemp = unit === 'F' 
+      ? (kelvin - 273.15) * 1.8 + 32  // K to F
+      : kelvin - 273.15;               // K to C
+    
+    // Map display temp to absolute scale position (0-1)
+    const absPosition = (displayTemp - absRange.min) / absRangeSize;
+    const clampedPosition = Math.max(0, Math.min(1, absPosition));
+    
+    // Get color at this position
+    const [r, g, b] = getColorForValue(clampedPosition, scale);
+
+    output[i] = r;
+    output[i + 1] = g;
+    output[i + 2] = b;
+    
+    output[i + 3] = typeof alpha === 'function' 
+      ? alpha(pixelValue / 255) 
+      : alpha;
+  }
+
+  return output;
+}
+
+/**
+ * Apply stepped colormap using absolute temperature mapping
+ * Creates discrete color bands at specified temperature levels
+ */
+export function applySteppedColormapWithAbsoluteTemp(
+  grayscaleData: Uint8ClampedArray,
+  scale: ColorScale,
+  levels: number[],  // Contour levels in Kelvin
+  dataMin: number,
+  dataMax: number,
+  unit: 'F' | 'C' = 'F',
+  alpha: number | ((normalizedValue: number) => number) = 200
+): Uint8ClampedArray {
+  const output = new Uint8ClampedArray(grayscaleData.length);
+  const dataRange = dataMax - dataMin;
+  const absRange = ABSOLUTE_TEMP_RANGES[unit];
+  const absRangeSize = absRange.max - absRange.min;
+  
+  // Sort levels
+  const sortedLevels = [...levels].sort((a, b) => a - b);
+  
+  // Pre-calculate colors for each band (using midpoint of each band in absolute temp scale)
+  const bandColors: [number, number, number][] = [];
+  
+  // Band below first level
+  if (sortedLevels.length > 0) {
+    const firstLevelF = unit === 'F' 
+      ? (sortedLevels[0] - 273.15) * 1.8 + 32 
+      : sortedLevels[0] - 273.15;
+    const belowMidF = (absRange.min + firstLevelF) / 2;
+    const belowPos = (belowMidF - absRange.min) / absRangeSize;
+    bandColors.push(getColorForValue(Math.max(0, Math.min(1, belowPos)), scale));
+  }
+  
+  // Bands between levels
+  for (let i = 0; i < sortedLevels.length - 1; i++) {
+    const lowF = unit === 'F'
+      ? (sortedLevels[i] - 273.15) * 1.8 + 32
+      : sortedLevels[i] - 273.15;
+    const highF = unit === 'F'
+      ? (sortedLevels[i + 1] - 273.15) * 1.8 + 32
+      : sortedLevels[i + 1] - 273.15;
+    const midF = (lowF + highF) / 2;
+    const midPos = (midF - absRange.min) / absRangeSize;
+    bandColors.push(getColorForValue(Math.max(0, Math.min(1, midPos)), scale));
+  }
+  
+  // Band above last level
+  if (sortedLevels.length > 0) {
+    const lastLevelF = unit === 'F'
+      ? (sortedLevels[sortedLevels.length - 1] - 273.15) * 1.8 + 32
+      : sortedLevels[sortedLevels.length - 1] - 273.15;
+    const aboveMidF = (lastLevelF + absRange.max) / 2;
+    const abovePos = (aboveMidF - absRange.min) / absRangeSize;
+    bandColors.push(getColorForValue(Math.max(0, Math.min(1, abovePos)), scale));
+  }
+
+  for (let i = 0; i < grayscaleData.length; i += 4) {
+    // Get pixel value and convert to Kelvin
+    const pixelValue = grayscaleData[i];
+    const kelvin = dataMin + (pixelValue / 255) * dataRange;
+    
+    // Find which band this value falls into
+    let bandIndex = 0;
+    for (let j = 0; j < sortedLevels.length; j++) {
+      if (kelvin >= sortedLevels[j]) {
+        bandIndex = j + 1;
+      } else {
+        break;
+      }
+    }
+    
+    // Get the pre-calculated color for this band
+    const [r, g, b] = bandColors[Math.min(bandIndex, bandColors.length - 1)] || [128, 128, 128];
+
+    output[i] = r;
+    output[i + 1] = g;
+    output[i + 2] = b;
+    
+    output[i + 3] = typeof alpha === 'function' 
+      ? alpha(pixelValue / 255) 
+      : alpha;
+  }
+
+  return output;
 }

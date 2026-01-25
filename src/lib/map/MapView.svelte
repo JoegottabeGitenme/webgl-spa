@@ -32,11 +32,14 @@
     type ColorScaleName,
     type ColorScale,
     applyColormapToImageData,
+    applyColormapWithAbsoluteTemp,
+    applySteppedColormapWithAbsoluteTemp,
     radarAlphaFunction,
   } from "../visualization/color-scales";
   import ColorLegend from "../components/ColorLegend.svelte";
   import { WindParticleLayer, fetchWindData, type WindData } from "../wind";
   import { AnimationManager, type LoadProgress, type ProgressiveLoadCallbacks } from "../animation";
+  import { extractContours, contoursToGeoJSON, downsampleData } from "../isoline";
 
   // Props
   interface Props {
@@ -201,6 +204,23 @@
   let windLayer: WindParticleLayer | null = null;
   let windData: WindData | null = null;
   
+  // Isoline layer (vector contours only)
+  let isolinesEnabled = $state(false);
+  let isolineInterval = $state(5.5);      // Default ~10°F interval (5.5K)
+  let isolineThickness = $state(3.5);
+  let isolineOpacity = $state(1.0);
+  let isolineColor = $state('#000000');   // Black by default
+  let showIsolineControls = $state(false);
+  let contourResolution = $state(2);      // Downsample factor (1=full, 2=half, 4=quarter)
+  let contourSmoothing = $state(0);       // Smoothing subdivisions (0=none, 1-8=smooth)
+  let contourLabelsEnabled = $state(true); // Show labels on contour lines
+  let contourLabelSize = $state(12);      // Label font size
+  let steppedColorsEnabled = $state(false); // Use discrete color steps instead of smooth gradient
+  let showGradientLayer = $state(true);     // Show/hide the underlying color gradient layer
+  const CONTOUR_SOURCE_ID = 'contour-source';
+  const CONTOUR_LAYER_ID = 'contour-lines';
+  const CONTOUR_LABELS_ID = 'contour-labels';
+  
   // Animation state
   let animationEnabled = $state(false);
   let animationPlaying = $state(false);
@@ -217,6 +237,7 @@
   let animationFrameId: number | null = null;
   let lastAnimationTime = 0;
   let lastRenderedFrameIndex = -1;  // Track last rendered frame to avoid redundant updates
+  let lastIsolineFrameIndex = -1;   // Track last isoline frame for animation interpolation
   const BASE_LOOP_DURATION = 4000;  // 4 seconds for full loop at 1x speed
   
   // Static weather data timestamp (when not animating)
@@ -653,6 +674,38 @@
   }
 
   /**
+   * Calculate contour levels that snap to nice round numbers in display units
+   * This matches the logic in extractContours for consistent alignment
+   */
+  function calculateContourLevels(dataMin: number, dataMax: number): number[] {
+    const levels: number[] = [];
+    
+    // Convert to display units
+    const displayMin = temperatureUnit === 'F' 
+      ? (dataMin - 273.15) * 1.8 + 32 
+      : dataMin - 273.15;
+    const displayMax = temperatureUnit === 'F'
+      ? (dataMax - 273.15) * 1.8 + 32
+      : dataMax - 273.15;
+    
+    // Calculate display interval
+    const displayInterval = Math.round(temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval);
+    
+    // Start from a clean multiple of the display interval
+    const startDisplayLevel = Math.ceil(displayMin / displayInterval) * displayInterval;
+    
+    for (let displayLevel = startDisplayLevel; displayLevel <= displayMax; displayLevel += displayInterval) {
+      // Convert back to Kelvin
+      const kelvinLevel = temperatureUnit === 'F'
+        ? (displayLevel - 32) / 1.8 + 273.15
+        : displayLevel + 273.15;
+      levels.push(kelvinLevel);
+    }
+    
+    return levels;
+  }
+  
+  /**
    * Apply a colormap to grayscale image data and return a data URL
    */
   function applyColormapToImage(
@@ -660,7 +713,8 @@
     width: number,
     height: number,
     scale: ColorScale,
-    bbox?: [number, number, number, number]
+    bbox?: [number, number, number, number],
+    metadata?: { min: number; max: number }
   ): string {
     const canvas = document.createElement('canvas');
     canvas.width = width;
@@ -677,7 +731,29 @@
     const isRadarScale = selectedScale === 'reflectivity' || selectedScale === 'radarWarm';
     const alpha = isRadarScale ? radarAlphaFunction : 200;
     
-    const coloredData = applyColormapToImageData(processedData, scale, alpha);
+    let coloredData: Uint8ClampedArray;
+    
+    // Check if this is temperature data that should use absolute temperature mapping
+    const isTemperatureData = metadata && (dataLayer === 'temperature' || dataLayer === 'dewpoint');
+    
+    if (isTemperatureData && metadata) {
+      if (steppedColorsEnabled && isolineInterval > 0) {
+        // Calculate levels that align with contour lines (snap to nice round numbers)
+        const levels = calculateContourLevels(metadata.min, metadata.max);
+        coloredData = applySteppedColormapWithAbsoluteTemp(
+          processedData, scale, levels, metadata.min, metadata.max, temperatureUnit, alpha
+        );
+      } else {
+        // Use absolute temperature mapping for smooth gradient
+        coloredData = applyColormapWithAbsoluteTemp(
+          processedData, scale, metadata.min, metadata.max, temperatureUnit, alpha
+        );
+      }
+    } else {
+      // Non-temperature data: use relative mapping
+      coloredData = applyColormapToImageData(processedData, scale, alpha);
+    }
+    
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const imageData = new ImageData(coloredData as any, width, height);
     ctx.putImageData(imageData, 0, 0);
@@ -712,7 +788,8 @@
       reprojected.width,
       reprojected.height,
       currentScale,  // Use currentScale which includes custom edits
-      sourceBbox
+      sourceBbox,
+      currentTile.metadata
     );
 
     // Use the bbox from the server response directly
@@ -767,19 +844,187 @@
         }
       });
     }
+    
+    // Update isoline layer (uses original non-reprojected data)
+    updateIsolineLayer();
+  }
+  
+  /**
+   * Create or update the isoline layer with grayscale data
+   * Uses ORIGINAL (non-reprojected) data - MapLibre handles projection for vector layers
+   */
+  function updateIsolineLayer() {
+    if (!map || !currentTile || !grayscaleData) return;
+    
+    // Use original non-reprojected data - MapLibre's vector layers
+    // automatically project GeoJSON coordinates from WGS84 to Mercator
+    updateVectorContours(grayscaleData, imageWidth, imageHeight);
+  }
+  
+  /**
+   * Update vector contours using marching squares and MapLibre line layers
+   */
+  function updateVectorContours(
+    data: Uint8ClampedArray,
+    width: number,
+    height: number
+  ) {
+    if (!map || !currentTile || !isolinesEnabled) return;
+    
+    const bbox = currentTile.metadata.bbox as [number, number, number, number];
+    const { min, max } = currentTile.metadata;
+    
+    // Optionally downsample data for faster processing
+    let processData = data;
+    let processWidth = width;
+    let processHeight = height;
+    
+    if (contourResolution > 1) {
+      const downsampled = downsampleData(data, width, height, contourResolution);
+      processData = downsampled.data;
+      processWidth = downsampled.width;
+      processHeight = downsampled.height;
+      console.log(`Downsampled ${width}x${height} -> ${processWidth}x${processHeight} (${contourResolution}x)`);
+    }
+    
+    // Extract contours using marching squares
+    // Pass display unit config to snap levels to nice round numbers (e.g., 0, 5, 10°F)
+    const displayInterval = temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval;
+    const displayUnitConfig = {
+      unit: temperatureUnit,
+      interval: Math.round(displayInterval)  // Round to nearest whole degree
+    };
+    
+    const startTime = performance.now();
+    const contours = extractContours(processData, processWidth, processHeight, min, max, bbox, isolineInterval, contourSmoothing, displayUnitConfig);
+    const geojson = contoursToGeoJSON(contours);
+    const elapsed = performance.now() - startTime;
+    
+    console.log(`Extracted ${contours.lines.length} contour lines at ${contours.levels.length} levels in ${elapsed.toFixed(1)}ms (smoothing=${contourSmoothing})`);
+    
+    // Update or create the GeoJSON source
+    const source = map.getSource(CONTOUR_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    
+    if (source) {
+      source.setData(geojson);
+    } else {
+      map.addSource(CONTOUR_SOURCE_ID, {
+        type: 'geojson',
+        data: geojson
+      });
+      
+      map.addLayer({
+        id: CONTOUR_LAYER_ID,
+        type: 'line',
+        source: CONTOUR_SOURCE_ID,
+        layout: {
+          'line-join': 'round',
+          'line-cap': 'round'
+        },
+        paint: {
+          'line-color': isolineColor,
+          'line-width': isolineThickness,
+          'line-opacity': isolineOpacity
+        }
+      });
+      
+      // Build text-field expression based on user's preferred temperature unit
+      // Kelvin to Celsius: K - 273.15
+      // Kelvin to Fahrenheit: (K - 273.15) * 1.8 + 32
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const textFieldExpression: any = temperatureUnit === 'F'
+        ? ['concat', 
+            ['to-string', ['round', ['+', ['*', ['-', ['get', 'level'], 273.15], 1.8], 32]]], 
+            '°F'
+          ]
+        : ['concat', 
+            ['to-string', ['round', ['-', ['get', 'level'], 273.15]]], 
+            '°C'
+          ];
+      
+      // Add labels layer
+      map.addLayer({
+        id: CONTOUR_LABELS_ID,
+        type: 'symbol',
+        source: CONTOUR_SOURCE_ID,
+        layout: {
+          'symbol-placement': 'line',
+          'symbol-spacing': 250,
+          'text-field': textFieldExpression,
+          'text-size': contourLabelSize,
+          'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+          'text-rotation-alignment': 'viewport',  // Keep text upright
+          'text-keep-upright': true,              // Flip text to stay readable
+          'text-pitch-alignment': 'viewport',
+          'visibility': contourLabelsEnabled ? 'visible' : 'none'
+        },
+        paint: {
+          'text-color': isolineColor,
+          'text-halo-color': '#ffffff',
+          'text-halo-width': 2,
+          'text-opacity': isolineOpacity
+        }
+      });
+      
+      console.log('Vector contour layer created with labels');
+    }
+    
+    // Update paint/layout properties if they changed
+    if (map.getLayer(CONTOUR_LAYER_ID)) {
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-color', isolineColor);
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-width', isolineThickness);
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-opacity', isolineOpacity);
+      // Ensure visibility
+      map.setLayoutProperty(CONTOUR_LAYER_ID, 'visibility', 'visible');
+      // Move to top so it renders above animation layers
+      map.moveLayer(CONTOUR_LAYER_ID);
+    }
+    
+    // Update labels layer
+    if (map.getLayer(CONTOUR_LABELS_ID)) {
+      map.setPaintProperty(CONTOUR_LABELS_ID, 'text-color', isolineColor);
+      map.setPaintProperty(CONTOUR_LABELS_ID, 'text-opacity', isolineOpacity);
+      map.setLayoutProperty(CONTOUR_LABELS_ID, 'text-size', contourLabelSize);
+      map.setLayoutProperty(CONTOUR_LABELS_ID, 'visibility', contourLabelsEnabled ? 'visible' : 'none');
+      // Move labels to top
+      map.moveLayer(CONTOUR_LABELS_ID);
+    }
+  }
+  
+  // Helper to convert hex color to RGB array [0-1]
+  function hexToRgb(hex: string): [number, number, number] {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    if (result) {
+      return [
+        parseInt(result[1], 16) / 255,
+        parseInt(result[2], 16) / 255,
+        parseInt(result[3], 16) / 255
+      ];
+    }
+    return [0, 0, 0];
   }
 
   /**
-   * Calculate actual min/max from pixel data and convert to real units
-   * This gives more accurate temperature ranges than API headers which may include outliers
+   * Update contour lines using the current data
+   * Uses ORIGINAL (non-reprojected) data because MapLibre vector layers
+   * automatically project GeoJSON coordinates from WGS84 to Mercator.
+   * This ensures contours align correctly with the raster layer.
+   */
+  function updateContours() {
+    if (!map || !currentTile || !grayscaleData) return;
+    
+    // Use original non-reprojected data - MapLibre handles projection for vector layers
+    // The raster layer uses reprojected data placed at CRS:84 coords,
+    // and vector layers use CRS:84 coords that MapLibre projects automatically.
+    updateVectorContours(grayscaleData, imageWidth, imageHeight);
+  }
+  
+  /**
+   * Calculate actual min/max values from the grayscale pixel data
    */
   function calculateActualMinMax() {
-    if (!grayscaleData || !currentTile) {
-      actualMin = null;
-      actualMax = null;
-      return;
-    }
-
+    if (!grayscaleData || !currentTile) return;
+    
     let min = 255;
     let max = 0;
     
@@ -1045,6 +1290,10 @@
       case 'w':
         handleWindToggle();
         break;
+      case 'i':
+        event.preventDefault();
+        handleIsolineToggle();
+        break;
       case 'u':
         event.preventDefault();
         mapLocked = !mapLocked;
@@ -1214,6 +1463,17 @@
       try { map.removeLayer('wind-particles'); } catch (e) {}
     }
     windLayer = null;
+    
+    // Clean up vector contours and labels
+    if (map?.getLayer(CONTOUR_LABELS_ID)) {
+      try { map.removeLayer(CONTOUR_LABELS_ID); } catch (e) {}
+    }
+    if (map?.getLayer(CONTOUR_LAYER_ID)) {
+      try { map.removeLayer(CONTOUR_LAYER_ID); } catch (e) {}
+    }
+    if (map?.getSource(CONTOUR_SOURCE_ID)) {
+      try { map.removeSource(CONTOUR_SOURCE_ID); } catch (e) {}
+    }
 
     // Clean up markers
     for (const marker of markers) {
@@ -1586,6 +1846,129 @@
     loadWeatherData();
   }
   
+  function handleIsolineToggle() {
+    if (!map) return;
+    isolinesEnabled = !isolinesEnabled;
+    
+    // Toggle vector contour layer visibility
+    if (map.getLayer(CONTOUR_LAYER_ID)) {
+      map.setLayoutProperty(CONTOUR_LAYER_ID, 'visibility', isolinesEnabled ? 'visible' : 'none');
+    } else if (isolinesEnabled && grayscaleData && currentTile) {
+      updateIsolineLayer();
+    }
+    
+    map.triggerRepaint();
+    console.log("Isolines:", isolinesEnabled ? "enabled" : "disabled");
+  }
+  
+  function updateIsolineInterval(event: Event) {
+    isolineInterval = parseFloat((event.target as HTMLInputElement).value);
+    // Regenerate contours with new interval
+    if (isolinesEnabled && grayscaleData && currentTile) {
+      updateIsolineLayer();
+    }
+  }
+  
+  function updateIsolineThickness(event: Event) {
+    isolineThickness = parseFloat((event.target as HTMLInputElement).value);
+    if (map?.getLayer(CONTOUR_LAYER_ID)) {
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-width', isolineThickness);
+    }
+  }
+  
+  function updateIsolineOpacity(event: Event) {
+    isolineOpacity = parseFloat((event.target as HTMLInputElement).value);
+    if (map?.getLayer(CONTOUR_LAYER_ID)) {
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-opacity', isolineOpacity);
+    }
+  }
+  
+  function updateIsolineColor(event: Event) {
+    isolineColor = (event.target as HTMLInputElement).value;
+    if (map?.getLayer(CONTOUR_LAYER_ID)) {
+      map.setPaintProperty(CONTOUR_LAYER_ID, 'line-color', isolineColor);
+    }
+  }
+  
+  function handleContourResolutionChange(event: Event) {
+    contourResolution = parseInt((event.target as HTMLSelectElement).value);
+    // Regenerate contours with new resolution
+    if (isolinesEnabled && grayscaleData && currentTile) {
+      updateIsolineLayer();
+    }
+    console.log("Contour resolution:", contourResolution + "x downsample");
+  }
+  
+  function handleContourSmoothingChange(event: Event) {
+    contourSmoothing = parseInt((event.target as HTMLInputElement).value);
+    // Regenerate contours with new smoothing
+    if (isolinesEnabled && grayscaleData && currentTile) {
+      updateIsolineLayer();
+    }
+    console.log("Contour smoothing:", contourSmoothing);
+  }
+  
+  function handleContourLabelsToggle(event: Event) {
+    contourLabelsEnabled = (event.target as HTMLInputElement).checked;
+    if (map?.getLayer(CONTOUR_LABELS_ID)) {
+      map.setLayoutProperty(CONTOUR_LABELS_ID, 'visibility', contourLabelsEnabled ? 'visible' : 'none');
+    }
+    console.log("Contour labels:", contourLabelsEnabled ? "enabled" : "disabled");
+  }
+  
+  function handleContourLabelSizeChange(event: Event) {
+    contourLabelSize = parseInt((event.target as HTMLInputElement).value);
+    if (map?.getLayer(CONTOUR_LABELS_ID)) {
+      map.setLayoutProperty(CONTOUR_LABELS_ID, 'text-size', contourLabelSize);
+    }
+  }
+  
+  // Helper to determine if weather/fill layer should be visible
+  // Layer is visible if: stepped colors is enabled (for fill) OR gradient layer is enabled (for smooth gradient)
+  function shouldShowWeatherLayer(): boolean {
+    return steppedColorsEnabled || showGradientLayer;
+  }
+  
+  // Update weather layer visibility based on current settings
+  function updateWeatherLayerVisibility() {
+    if (!map) return;
+    const visibility = shouldShowWeatherLayer() ? 'visible' : 'none';
+    
+    // Toggle static weather layer
+    if (map.getLayer('weather-layer')) {
+      map.setLayoutProperty('weather-layer', 'visibility', visibility);
+    }
+    // Toggle all animation layers
+    for (const layerId of animationLayerIds) {
+      if (map.getLayer(layerId)) {
+        map.setLayoutProperty(layerId, 'visibility', visibility);
+      }
+    }
+  }
+  
+  function handleSteppedColorsToggle(event: Event) {
+    steppedColorsEnabled = (event.target as HTMLInputElement).checked;
+    // Re-render the weather layer with new color mode
+    if (grayscaleData && currentTile) {
+      updateWeatherLayer();
+    }
+    // Also re-render animation frames if in animation mode
+    if (animationManager?.hasFrames()) {
+      preRenderAnimationFrames();
+      updateAllAnimationSources();
+    }
+    // Update visibility - stepped colors needs the layer to be visible for fill
+    updateWeatherLayerVisibility();
+    console.log("Stepped colors:", steppedColorsEnabled ? "enabled" : "disabled");
+  }
+  
+  function handleGradientLayerToggle(event: Event) {
+    showGradientLayer = (event.target as HTMLInputElement).checked;
+    // Update visibility - respects stepped colors state
+    updateWeatherLayerVisibility();
+    console.log("Gradient layer:", showGradientLayer ? "visible" : "hidden");
+  }
+  
   function updateWindSpeed(event: Event) {
     windSpeedFactor = parseFloat((event.target as HTMLInputElement).value);
     windLayer?.setSpeedFactor(windSpeedFactor);
@@ -1693,7 +2076,8 @@
         reprojected.width,
         reprojected.height,
         currentScale,  // Use currentScale which includes custom edits
-        sourceBbox
+        sourceBbox,
+        frameData.metadata
       );
 
       // Cache the rendered URL at this position
@@ -2087,6 +2471,9 @@
 
     animationPlaying = true;
     lastAnimationTime = performance.now();
+    
+    // Reset isoline frame tracking to ensure isolines update on first frame
+    lastIsolineFrameIndex = -1;
 
     // Detach moveend listener during animation to prevent request storm
     if (!compact && map) {
@@ -2177,6 +2564,23 @@
       const windDataForFrame = animationManager.getWindDataAtPosition(animationPosition);
       if (windDataForFrame) {
         windLayer.setWindData(windDataForFrame);
+      }
+    }
+    
+    // Update isoline layer with data from current animation frame
+    // Uses ORIGINAL (non-reprojected) data - MapLibre handles projection for vector layers
+    if (isolinesEnabled && animationManager && currentCacheKey !== lastIsolineFrameIndex) {
+      const frameData = animationManager.getFrameAtPosition(animationPosition);
+      if (frameData) {
+        // Update vector contours for this animation frame
+        // Temporarily set currentTile metadata for the contour extraction
+        const savedTile = currentTile;
+        currentTile = { ...currentTile!, metadata: frameData.metadata };
+        // Use original non-reprojected data
+        updateVectorContours(frameData.grayscaleData, frameData.width, frameData.height);
+        currentTile = savedTile;
+        
+        lastIsolineFrameIndex = currentCacheKey;
       }
     }
 
@@ -3079,6 +3483,29 @@
     {/if}
 
     <button
+      class="map-view__isoline-toggle"
+      class:map-view__isoline-toggle--active={isolinesEnabled}
+      onclick={handleIsolineToggle}
+      title={isolinesEnabled ? "Hide isolines" : "Show isolines"}
+    >
+      <svg class="map-view__isoline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M3 18c3-3 6-3 9 0s6 3 9 0" stroke-linecap="round"/>
+        <path d="M3 12c3-3 6-3 9 0s6 3 9 0" stroke-linecap="round"/>
+        <path d="M3 6c3-3 6-3 9 0s6 3 9 0" stroke-linecap="round"/>
+      </svg>
+      <span>Isolines <kbd>I</kbd></span>
+    </button>
+    
+    {#if isolinesEnabled}
+      <button
+        class="map-view__settings-toggle"
+        onclick={() => showIsolineControls = !showIsolineControls}
+      >
+        Contours
+      </button>
+    {/if}
+
+    <button
       class="map-view__lock-toggle"
       class:map-view__lock-toggle--locked={mapLocked}
       onclick={() => mapLocked = !mapLocked}
@@ -3286,6 +3713,112 @@
       </div>
     </div>
   {/if}
+  
+  {#if isolinesEnabled && showIsolineControls && !compact}
+    <div class="map-view__isoline-settings">
+      <div class="map-view__settings-header">
+        <span>Isoline Settings</span>
+        <button class="map-view__settings-close" onclick={() => showIsolineControls = false}>x</button>
+      </div>
+      
+      <div class="map-view__setting">
+        <label for="isoline-interval">Interval: {temperatureUnit === 'F' ? (isolineInterval * 1.8).toFixed(0) + '°F' : isolineInterval.toFixed(1) + '°C'}</label>
+        <input type="range" id="isoline-interval" min="0.5" max="10" step="0.5" value={isolineInterval} oninput={updateIsolineInterval} />
+      </div>
+      
+      <div class="map-view__setting">
+        <label for="isoline-thickness">Thickness: {isolineThickness.toFixed(1)}</label>
+        <input type="range" id="isoline-thickness" min="0.2" max="10" step="0.1" value={isolineThickness} oninput={updateIsolineThickness} />
+      </div>
+      
+      <div class="map-view__setting">
+        <label for="isoline-opacity">Opacity: {(isolineOpacity * 100).toFixed(0)}%</label>
+        <input type="range" id="isoline-opacity" min="0.1" max="1" step="0.1" value={isolineOpacity} oninput={updateIsolineOpacity} />
+      </div>
+      
+      <div class="map-view__setting map-view__setting--color">
+        <label for="isoline-color">Color:</label>
+        <input type="color" id="isoline-color" value={isolineColor} oninput={updateIsolineColor} />
+        <span class="map-view__color-value">{isolineColor}</span>
+      </div>
+      
+      <div class="map-view__setting">
+        <label for="contour-resolution">Resolution:</label>
+        <select 
+          id="contour-resolution" 
+          class="map-view__select"
+          value={String(contourResolution)}
+          onchange={handleContourResolutionChange}
+        >
+          <option value="1">Full (slow)</option>
+          <option value="2">1/2 (faster)</option>
+          <option value="4">1/4 (fast)</option>
+          <option value="8">1/8 (fastest)</option>
+        </select>
+      </div>
+      
+      <div class="map-view__setting">
+        <label for="contour-smoothing">Smoothing: {contourSmoothing === 0 ? 'None' : contourSmoothing}</label>
+        <input 
+          type="range" 
+          id="contour-smoothing" 
+          min="0" 
+          max="8" 
+          step="1" 
+          value={contourSmoothing} 
+          oninput={handleContourSmoothingChange} 
+        />
+      </div>
+      
+      <div class="map-view__setting map-view__setting--toggle">
+        <label>
+          <input 
+            type="checkbox" 
+            checked={contourLabelsEnabled} 
+            onchange={handleContourLabelsToggle}
+          />
+          Show labels
+        </label>
+      </div>
+      
+      {#if contourLabelsEnabled}
+        <div class="map-view__setting">
+          <label for="contour-label-size">Label size: {contourLabelSize}px</label>
+          <input 
+            type="range" 
+            id="contour-label-size" 
+            min="8" 
+            max="24" 
+            step="1" 
+            value={contourLabelSize} 
+            oninput={handleContourLabelSizeChange} 
+          />
+        </div>
+      {/if}
+      
+      <div class="map-view__setting map-view__setting--toggle">
+        <label>
+          <input 
+            type="checkbox" 
+            checked={steppedColorsEnabled} 
+            onchange={handleSteppedColorsToggle}
+          />
+          Stepped colors (color fill)
+        </label>
+      </div>
+      
+      <div class="map-view__setting map-view__setting--toggle">
+        <label>
+          <input 
+            type="checkbox" 
+            checked={showGradientLayer} 
+            onchange={handleGradientLayerToggle}
+          />
+          Show gradient layer
+        </label>
+      </div>
+    </div>
+  {/if}
 
   {#if showHelpModal}
     <div class="map-view__modal-overlay" onclick={() => showHelpModal = false}>
@@ -3316,6 +3849,10 @@
               <tr>
                 <td><kbd>W</kbd></td>
                 <td>Toggle wind layer</td>
+              </tr>
+              <tr>
+                <td><kbd>I</kbd></td>
+                <td>Toggle isoline (contour) layer</td>
               </tr>
               <tr>
                 <td><kbd>R</kbd></td>
@@ -3993,6 +4530,118 @@
   .map-view__wind-icon {
     width: 16px;
     height: 16px;
+  }
+
+  .map-view__isoline-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(4px);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .map-view__isoline-toggle kbd {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    opacity: 0.7;
+  }
+
+  .map-view__isoline-toggle:hover {
+    border-color: var(--color-accent);
+    color: white;
+  }
+
+  .map-view__isoline-toggle--active {
+    background: rgba(100, 180, 100, 0.3);
+    border-color: rgb(100, 180, 100);
+    color: white;
+  }
+
+  .map-view__isoline-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .map-view__isoline-settings {
+    position: absolute;
+    top: 160px;
+    left: var(--spacing-md);
+    background: rgba(30, 30, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-sm);
+    width: 240px;
+    z-index: 100;
+  }
+
+  .map-view__setting--color {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+  }
+
+  .map-view__setting--color label {
+    flex-shrink: 0;
+  }
+
+  .map-view__setting--color input[type="color"] {
+    width: 40px;
+    height: 28px;
+    padding: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .map-view__color-value {
+    font-family: monospace;
+    font-size: var(--font-size-xs);
+    color: rgba(255, 255, 255, 0.6);
+  }
+
+  .map-view__select {
+    background: rgba(50, 50, 50, 0.9);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    margin-left: auto;
+  }
+
+  .map-view__select:hover {
+    border-color: rgba(255, 255, 255, 0.5);
+  }
+
+  .map-view__setting--toggle {
+    margin-top: var(--spacing-sm);
+    padding-top: var(--spacing-sm);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .map-view__setting--toggle label {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+  }
+
+  .map-view__setting--toggle input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
   }
 
   .map-view__wind-spinner {

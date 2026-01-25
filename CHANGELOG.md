@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Multi-handle slider for color legend editor with draggable temperature breakpoints
+- Clickable color bands in legend editor to change colors at specific temperature ranges
+- Absolute temperature color mapping functions for consistent color scale alignment
+
+### Fixed
+- Stepped colors (color fill) now works independently of "Show gradient layer" toggle
+- Temperature contour labels now display in user's preferred unit (F/C) instead of hardcoded Celsius
+- Isoline interval slider label now shows values in preferred temperature unit
+- Contour levels now snap to nice round numbers in display units (e.g., 0°F, 5°F, 10°F)
+- Fixed projection mismatch between contour lines and raster layer (contours now use original data, MapLibre handles projection)
+- Fixed half-pixel offset in contour coordinates for proper alignment with raster layer
+- Color legend editor colors now correctly match map visualization using absolute temperature scale (-60°F to 130°F)
+
+### Changed
+- Color legend editor redesigned with larger visual slider (700px wide, 48px track)
+- Color scale now uses absolute temperature range mapping instead of relative data range
+
+## [1.0.0-beta] - 2026-01-24
+
+### Added
 - Initial project setup with SvelteKit 2 and Svelte 5
 - Interactive weather map using MapLibre GL JS
 - WebGL wind particle visualization layer
