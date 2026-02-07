@@ -25,6 +25,7 @@
     type DataTile,
     type TileMetadata,
     type CollectionSummary,
+    type CollectionMetadata,
   } from "../data/edr-client";
   import {
     COLOR_SCALES,
@@ -32,14 +33,25 @@
     type ColorScaleName,
     type ColorScale,
     applyColormapToImageData,
-    applyColormapWithAbsoluteTemp,
-    applySteppedColormapWithAbsoluteTemp,
+    applySteppedColormapWithLevels,
     radarAlphaFunction,
   } from "../visualization/color-scales";
   import ColorLegend from "../components/ColorLegend.svelte";
   import { WindParticleLayer, fetchWindData, type WindData } from "../wind";
   import { AnimationManager, type LoadProgress, type ProgressiveLoadCallbacks } from "../animation";
   import { extractContours, contoursToGeoJSON, downsampleData } from "../isoline";
+  import {
+    type TileCoord,
+    type BBox,
+    getVisibleTiles,
+    mapZoomToTileZoom,
+    tileKey,
+    tilesCombinedBbox,
+  } from "../tiles/tile-utils";
+  import { TileCache, getTileCache, type CachedTile } from "../tiles/TileCache";
+  import { TileCompositor, getTileCompositor, type CompositeResult } from "../tiles/TileCompositor";
+  import { getParameterScale, type ParameterScale } from "../tiles/parameter-scales";
+  import { fetchTiles } from "../data/edr-client";
 
   // Props
   interface Props {
@@ -196,6 +208,13 @@
   let imageWidth = 0;
   let imageHeight = 0;
   
+  // Tile-based loading
+  let useTiledLoading = $state(true);  // Enable tile-based loading by default
+  let tileZoomOffset = $state(3);      // Map zoom - offset = tile zoom
+  let currentTileCoords = $state<TileCoord[]>([]);
+  let compositeBbox = $state<BBox | null>(null);  // Bbox of the composited tiles
+  let isMercatorProjected = $state(false);  // True when data is already in EPSG:3857
+  
   // Actual min/max calculated from pixel data (more accurate than API headers)
   let actualMin = $state<number | null>(null);
   let actualMax = $state<number | null>(null);
@@ -244,6 +263,11 @@
   let staticTimestamp = $state<string | null>(null);
   // Current animation timestamp (updated during playback)
   let animationTimestamp = $state<string | null>(null);
+  
+  // Collection temporal metadata (for showing extent info in UI)
+  let collectionMeta = $state<CollectionMetadata | null>(null);
+  // Animation frame timestamps (for showing loaded range)
+  let animationFrameTimestamps = $state<string[]>([]);
 
   // Marker state
   interface TimeSeriesPoint {
@@ -674,32 +698,148 @@
   }
 
   /**
+   * Get the actual data units from the API response
+   * Falls back to checking dataLayer if no currentTile is loaded
+   */
+  function getDataUnits(): string {
+    if (currentTile?.metadata?.units) {
+      return currentTile.metadata.units;
+    }
+    // Fallback to dataLayer-based detection
+    switch (dataLayer) {
+      case 'temperature':
+      case 'dewpoint':
+        return 'K';
+      case 'humidity':
+        return '%';
+      case 'precipitation':
+        return 'mm';
+      case 'reflectivity':
+        return 'dBZ';
+      default:
+        return '';
+    }
+  }
+  
+  /**
+   * Check if the current data uses temperature units (Kelvin)
+   * Uses actual API response units, not UI selection
+   */
+  function isTemperatureData(): boolean {
+    const units = getDataUnits();
+    return units === 'K';
+  }
+  
+  /**
+   * Get the appropriate unit suffix for contour labels based on actual data units
+   */
+  function getContourLabelUnit(): string {
+    const units = getDataUnits();
+    switch (units) {
+      case 'K':
+        return temperatureUnit === 'F' ? '°F' : '°C';
+      case '%':
+        return '%';
+      case 'mm':
+        return 'mm';
+      case 'dBZ':
+        return 'dBZ';
+      default:
+        return units || '';
+    }
+  }
+  
+  /**
+   * Build MapLibre expression for contour label text based on data type
+   * Returns the appropriate expression to convert raw values to display values
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function buildContourTextFieldExpression(): any {
+    const unit = getContourLabelUnit();
+    
+    if (isTemperatureData()) {
+      // Temperature data: convert from Kelvin to F or C
+      // Kelvin to Celsius: K - 273.15
+      // Kelvin to Fahrenheit: (K - 273.15) * 1.8 + 32
+      return temperatureUnit === 'F'
+        ? ['concat', 
+            ['to-string', ['round', ['+', ['*', ['-', ['get', 'level'], 273.15], 1.8], 32]]], 
+            unit
+          ]
+        : ['concat', 
+            ['to-string', ['round', ['-', ['get', 'level'], 273.15]]], 
+            unit
+          ];
+    } else {
+      // Non-temperature data: display the raw value rounded
+      return ['concat', 
+        ['to-string', ['round', ['get', 'level']]], 
+        unit
+      ];
+    }
+  }
+  
+  /**
+   * Get display interval label for the UI slider
+   * Uses actual API units to determine formatting
+   */
+  function getIntervalDisplayLabel(): string {
+    const units = getDataUnits();
+    switch (units) {
+      case 'K':
+        return temperatureUnit === 'F' 
+          ? `${(isolineInterval * 1.8).toFixed(0)}°F` 
+          : `${isolineInterval.toFixed(1)}°C`;
+      case '%':
+        return `${isolineInterval.toFixed(0)}%`;
+      case 'mm':
+        return `${isolineInterval.toFixed(1)}mm`;
+      case 'dBZ':
+        return `${isolineInterval.toFixed(0)}dBZ`;
+      default:
+        return `${isolineInterval.toFixed(1)}${units}`;
+    }
+  }
+  
+  /**
    * Calculate contour levels that snap to nice round numbers in display units
    * This matches the logic in extractContours for consistent alignment
    */
   function calculateContourLevels(dataMin: number, dataMax: number): number[] {
     const levels: number[] = [];
     
-    // Convert to display units
-    const displayMin = temperatureUnit === 'F' 
-      ? (dataMin - 273.15) * 1.8 + 32 
-      : dataMin - 273.15;
-    const displayMax = temperatureUnit === 'F'
-      ? (dataMax - 273.15) * 1.8 + 32
-      : dataMax - 273.15;
-    
-    // Calculate display interval
-    const displayInterval = Math.round(temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval);
-    
-    // Start from a clean multiple of the display interval
-    const startDisplayLevel = Math.ceil(displayMin / displayInterval) * displayInterval;
-    
-    for (let displayLevel = startDisplayLevel; displayLevel <= displayMax; displayLevel += displayInterval) {
-      // Convert back to Kelvin
-      const kelvinLevel = temperatureUnit === 'F'
-        ? (displayLevel - 32) / 1.8 + 273.15
-        : displayLevel + 273.15;
-      levels.push(kelvinLevel);
+    if (isTemperatureData()) {
+      // Temperature data: convert from Kelvin to display units
+      const displayMin = temperatureUnit === 'F' 
+        ? (dataMin - 273.15) * 1.8 + 32 
+        : dataMin - 273.15;
+      const displayMax = temperatureUnit === 'F'
+        ? (dataMax - 273.15) * 1.8 + 32
+        : dataMax - 273.15;
+      
+      // Calculate display interval
+      const displayInterval = Math.round(temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval);
+      
+      // Start from a clean multiple of the display interval
+      const startDisplayLevel = Math.ceil(displayMin / displayInterval) * displayInterval;
+      
+      for (let displayLevel = startDisplayLevel; displayLevel <= displayMax; displayLevel += displayInterval) {
+        // Convert back to Kelvin
+        const kelvinLevel = temperatureUnit === 'F'
+          ? (displayLevel - 32) / 1.8 + 273.15
+          : displayLevel + 273.15;
+        levels.push(kelvinLevel);
+      }
+    } else {
+      // Non-temperature data: use values directly (humidity %, precipitation mm, etc.)
+      const interval = isolineInterval;
+      
+      // Start from a clean multiple of the interval
+      const startLevel = Math.ceil(dataMin / interval) * interval;
+      
+      for (let level = startLevel; level <= dataMax; level += interval) {
+        levels.push(level);
+      }
     }
     
     return levels;
@@ -733,24 +873,14 @@
     
     let coloredData: Uint8ClampedArray;
     
-    // Check if this is temperature data that should use absolute temperature mapping
-    const isTemperatureData = metadata && (dataLayer === 'temperature' || dataLayer === 'dewpoint');
-    
-    if (isTemperatureData && metadata) {
-      if (steppedColorsEnabled && isolineInterval > 0) {
-        // Calculate levels that align with contour lines (snap to nice round numbers)
-        const levels = calculateContourLevels(metadata.min, metadata.max);
-        coloredData = applySteppedColormapWithAbsoluteTemp(
-          processedData, scale, levels, metadata.min, metadata.max, temperatureUnit, alpha
-        );
-      } else {
-        // Use absolute temperature mapping for smooth gradient
-        coloredData = applyColormapWithAbsoluteTemp(
-          processedData, scale, metadata.min, metadata.max, temperatureUnit, alpha
-        );
-      }
+    // Use relative mapping: full gradient spans the actual data range from API headers
+    // This ensures rich gradients regardless of the specific data values
+    if (steppedColorsEnabled && isolineInterval > 0 && metadata) {
+      // Stepped colors: create discrete bands at contour levels
+      const levels = calculateContourLevels(metadata.min, metadata.max);
+      coloredData = applySteppedColormapWithLevels(processedData, scale, levels, metadata.min, metadata.max, alpha);
     } else {
-      // Non-temperature data: use relative mapping
+      // Smooth gradient: pixel 0 = min color, pixel 255 = max color
       coloredData = applyColormapToImageData(processedData, scale, alpha);
     }
     
@@ -769,24 +899,51 @@
 
     const sourceBbox = currentTile.metadata.bbox as [number, number, number, number];
 
-    // Reproject from CRS:84 to Web Mercator to fix distortion on the Mercator map
-    const reprojected = reprojectToMercator(
-      grayscaleData,
-      imageWidth,
-      imageHeight,
-      sourceBbox
-    );
+    let dataToColor: Uint8ClampedArray;
+    let outputWidth: number;
+    let outputHeight: number;
 
-    // Apply blur to reprojected data if blur mode is enabled
-    let dataToColor = reprojected.data;
-    if (interpolationMode === 'blur') {
-      dataToColor = applyGaussianBlur(reprojected.data, reprojected.width, reprojected.height);
+    if (isMercatorProjected) {
+      // Data is already in EPSG:3857 (from tiles), no reprojection needed
+      dataToColor = grayscaleData;
+      outputWidth = imageWidth;
+      outputHeight = imageHeight;
+      
+      // Apply blur if enabled
+      if (interpolationMode === 'blur') {
+        dataToColor = applyGaussianBlur(dataToColor, outputWidth, outputHeight);
+      }
+      
+      console.log(`Updating weather layer (tile-based, no reprojection):`);
+      console.log(`  Composite bbox: [${sourceBbox.map(v => v.toFixed(4)).join(', ')}]`);
+      console.log(`  Image dimensions: ${outputWidth}x${outputHeight}`);
+    } else {
+      // Reproject from CRS:84 to Web Mercator to fix distortion on the Mercator map
+      const reprojected = reprojectToMercator(
+        grayscaleData,
+        imageWidth,
+        imageHeight,
+        sourceBbox
+      );
+      
+      dataToColor = reprojected.data;
+      outputWidth = reprojected.width;
+      outputHeight = reprojected.height;
+
+      // Apply blur to reprojected data if blur mode is enabled
+      if (interpolationMode === 'blur') {
+        dataToColor = applyGaussianBlur(dataToColor, outputWidth, outputHeight);
+      }
+      
+      console.log(`Updating weather layer (single request, reprojected):`);
+      console.log(`  Source bbox (from server): [${sourceBbox.map(v => v.toFixed(4)).join(', ')}]`);
+      console.log(`  Image dimensions: ${imageWidth}x${imageHeight} -> reprojected ${outputWidth}x${outputHeight}`);
     }
 
     const coloredDataUrl = applyColormapToImage(
       dataToColor,
-      reprojected.width,
-      reprojected.height,
+      outputWidth,
+      outputHeight,
       currentScale,  // Use currentScale which includes custom edits
       sourceBbox,
       currentTile.metadata
@@ -797,11 +954,6 @@
 
     // Use linear resampling for smooth/blur, nearest for pixelated
     const resampling = interpolationMode === 'pixelated' ? 'nearest' : 'linear';
-
-    console.log(`Updating weather layer:`);
-    console.log(`  Source bbox (from server): [${sourceBbox.map(v => v.toFixed(4)).join(', ')}]`);
-    console.log(`  Image dimensions: ${imageWidth}x${imageHeight} -> reprojected ${reprojected.width}x${reprojected.height}`);
-    console.log(`  Pixel size (source): ${((sourceBbox[2]-sourceBbox[0])/imageWidth).toFixed(4)}° x ${((sourceBbox[3]-sourceBbox[1])/imageHeight).toFixed(4)}°`);
     
     const source = map.getSource(WEATHER_SOURCE_ID) as maplibregl.ImageSource | undefined;
 
@@ -888,15 +1040,30 @@
     }
     
     // Extract contours using marching squares
-    // Pass display unit config to snap levels to nice round numbers (e.g., 0, 5, 10°F)
-    const displayInterval = temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval;
-    const displayUnitConfig = {
-      unit: temperatureUnit,
-      interval: Math.round(displayInterval)  // Round to nearest whole degree
-    };
-    
+    // Pass display unit config for proper level snapping
     const startTime = performance.now();
+    
+    // Build display unit config based on data type
+    let displayUnitConfig: { unit: 'F' | 'C' | 'K'; interval: number };
+    
+    if (isTemperatureData()) {
+      // Temperature: convert to user's preferred unit
+      const displayInterval = temperatureUnit === 'F' ? isolineInterval * 1.8 : isolineInterval;
+      displayUnitConfig = {
+        unit: temperatureUnit,
+        interval: Math.round(displayInterval)  // Round to nearest whole degree
+      };
+    } else {
+      // Non-temperature data (humidity %, precipitation mm, etc.)
+      // Use 'K' unit which does no conversion (pass-through) but still gets snapping
+      displayUnitConfig = {
+        unit: 'K',
+        interval: Math.round(isolineInterval)  // Round to nearest whole number (e.g., 10%)
+      };
+    }
+    
     const contours = extractContours(processData, processWidth, processHeight, min, max, bbox, isolineInterval, contourSmoothing, displayUnitConfig);
+    
     const geojson = contoursToGeoJSON(contours);
     const elapsed = performance.now() - startTime;
     
@@ -928,19 +1095,8 @@
         }
       });
       
-      // Build text-field expression based on user's preferred temperature unit
-      // Kelvin to Celsius: K - 273.15
-      // Kelvin to Fahrenheit: (K - 273.15) * 1.8 + 32
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const textFieldExpression: any = temperatureUnit === 'F'
-        ? ['concat', 
-            ['to-string', ['round', ['+', ['*', ['-', ['get', 'level'], 273.15], 1.8], 32]]], 
-            '°F'
-          ]
-        : ['concat', 
-            ['to-string', ['round', ['-', ['get', 'level'], 273.15]]], 
-            '°C'
-          ];
+      // Build text-field expression based on data type
+      const textFieldExpression = buildContourTextFieldExpression();
       
       // Add labels layer
       map.addLayer({
@@ -956,6 +1112,8 @@
           'text-rotation-alignment': 'viewport',  // Keep text upright
           'text-keep-upright': true,              // Flip text to stay readable
           'text-pitch-alignment': 'viewport',
+          'text-allow-overlap': true,             // Don't hide labels due to collision
+          'text-ignore-placement': true,          // Don't affect other label placement
           'visibility': contourLabelsEnabled ? 'visible' : 'none'
         },
         paint: {
@@ -986,6 +1144,8 @@
       map.setPaintProperty(CONTOUR_LABELS_ID, 'text-opacity', isolineOpacity);
       map.setLayoutProperty(CONTOUR_LABELS_ID, 'text-size', contourLabelSize);
       map.setLayoutProperty(CONTOUR_LABELS_ID, 'visibility', contourLabelsEnabled ? 'visible' : 'none');
+      // Update text-field expression when data type or unit changes
+      map.setLayoutProperty(CONTOUR_LABELS_ID, 'text-field', buildContourTextFieldExpression());
       // Move labels to top
       map.moveLayer(CONTOUR_LABELS_ID);
     }
@@ -1043,6 +1203,157 @@
     console.log(`Actual data range: ${actualMin.toFixed(1)} - ${actualMax.toFixed(1)} ${currentTile.metadata.units} (API reported: ${currentTile.metadata.min.toFixed(1)} - ${currentTile.metadata.max.toFixed(1)})`);
   }
 
+  /**
+   * Load weather data using tile-based approach.
+   * Fetches multiple smaller tiles and composites them.
+   */
+  async function loadWeatherDataTiled(
+    west: number,
+    south: number,
+    east: number,
+    north: number,
+    mapZoom: number,
+    selectedTimestamp: string | null
+  ) {
+    const tileCache = getTileCache();
+    const compositor = getTileCompositor();
+    
+    // Calculate tile zoom level
+    // Minimum zoom 4 ensures tiles are ~2500km at most (won't cause 413 errors)
+    // Maximum zoom 8 keeps tile count reasonable
+    const tileZoom = mapZoomToTileZoom(mapZoom, tileZoomOffset, 4, 8);
+    
+    // Get visible tiles
+    const viewportBbox: BBox = { west, south, east, north };
+    const tiles = getVisibleTiles(viewportBbox, tileZoom);
+    currentTileCoords = tiles;
+    
+    console.log(`Tile-based loading: map zoom ${mapZoom.toFixed(1)} -> tile zoom ${tileZoom}, ${tiles.length} tiles`);
+    
+    // Fetch tiles (with caching)
+    const fetchResult = await fetchTiles(tiles, tileCache, {
+      collection: selectedCollection,
+      parameter: selectedParameter,
+      datetime: selectedTimestamp ?? undefined,
+      z: selectedVerticalLevel ?? undefined,
+      useGlobalScale: true,  // Renormalize to global fixed scale
+    });
+    
+    if (fetchResult.errors.size > 0) {
+      console.warn(`${fetchResult.errors.size} tiles failed to load:`, fetchResult.errors);
+      
+      // If all tiles failed (likely 413 errors), fall back to single request mode
+      if (fetchResult.tiles.size === 0) {
+        console.log('All tiles failed, falling back to single request mode');
+        await loadWeatherDataSingle(west, south, east, north, selectedTimestamp);
+        return;
+      }
+    }
+    
+    // Composite tiles
+    const composite = compositor.composite(
+      fetchResult.tiles,
+      tiles,
+      selectedCollection,
+      selectedParameter,
+      selectedTimestamp ?? undefined
+    );
+    
+    if (!composite) {
+      throw new Error('Failed to composite tiles');
+    }
+    
+    // Set the grayscale data and dimensions
+    grayscaleData = composite.data;
+    imageWidth = composite.width;
+    imageHeight = composite.height;
+    compositeBbox = composite.bbox;
+    isMercatorProjected = false;  // Tiles are CRS:84, client reprojection needed
+    
+    // Create a synthetic currentTile for compatibility with existing code
+    const paramScale = getParameterScale(selectedParameter);
+    currentTile = {
+      image: createImageFromData(composite.data, composite.width, composite.height),
+      metadata: {
+        encoding: 'uint8',
+        min: paramScale.min,
+        max: paramScale.max,
+        units: paramScale.unit,
+        bbox: [composite.bbox.west, composite.bbox.south, composite.bbox.east, composite.bbox.north],
+        width: composite.width,
+        height: composite.height,
+        parameter: selectedParameter,
+        crs: 'CRS:84',  // Geographic projection - will be reprojected by client
+        datetime: selectedTimestamp ?? undefined,
+      },
+    };
+    
+    // Update last loaded bbox
+    lastLoadedBbox = composite.bbox;
+    
+    console.log(`Tiled data loaded: ${imageWidth}x${imageHeight} from ${fetchResult.tiles.size} tiles, bbox: [${composite.bbox.west.toFixed(4)}, ${composite.bbox.south.toFixed(4)}, ${composite.bbox.east.toFixed(4)}, ${composite.bbox.north.toFixed(4)}]`);
+  }
+
+  /**
+   * Create an HTMLImageElement from RGBA data.
+   * Used for compatibility with existing code that expects an image.
+   */
+  function createImageFromData(data: Uint8ClampedArray, width: number, height: number): HTMLImageElement {
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d')!;
+    const imageData = ctx.createImageData(width, height);
+    imageData.data.set(data);
+    ctx.putImageData(imageData, 0, 0);
+    
+    const img = new Image();
+    img.src = canvas.toDataURL();
+    return img;
+  }
+
+  /**
+   * Load weather data using single request approach (original method).
+   * Makes one large request for the entire viewport.
+   */
+  async function loadWeatherDataSingle(
+    west: number,
+    south: number,
+    east: number,
+    north: number,
+    selectedTimestamp: string | null
+  ) {
+    isMercatorProjected = false;  // Data will be CRS:84, needs reprojection
+    compositeBbox = null;
+    
+    // Omit width/height to get native grid resolution from server
+    currentTile = await fetchDataTile({
+      parameter: selectedParameter,
+      collection: selectedCollection,
+      bbox: { west, south, east, north },
+      datetime: selectedTimestamp ?? undefined,
+      z: selectedVerticalLevel ?? undefined,
+      crs: selectedCRS,
+    });
+    
+    // Extract grayscale data for re-coloring
+    const canvas = document.createElement('canvas');
+    canvas.width = currentTile.image.width;
+    canvas.height = currentTile.image.height;
+    imageWidth = canvas.width;
+    imageHeight = canvas.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(currentTile.image, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    grayscaleData = new Uint8ClampedArray(imgData.data);
+    
+    // Update last loaded bbox
+    const [bboxWest, bboxSouth, bboxEast, bboxNorth] = currentTile.metadata.bbox;
+    lastLoadedBbox = { west: bboxWest, south: bboxSouth, east: bboxEast, north: bboxNorth };
+    
+    console.log(`Single request data loaded: ${imageWidth}x${imageHeight} (native grid), range: ${currentTile.metadata.min.toFixed(1)} - ${currentTile.metadata.max.toFixed(1)} ${currentTile.metadata.units}`);
+  }
+
   async function loadWeatherData() {
     if (!map) return;
 
@@ -1055,19 +1366,21 @@
       const south = Math.max(-85, bounds.getSouth());
       const east = Math.min(180, bounds.getEast());
       const north = Math.min(85, bounds.getNorth());
+      const mapZoom = map.getZoom();
 
       // Use selectedCollection and selectedParameter for data fetching
       console.log(`Requesting ${selectedParameter} from ${selectedCollection} for bbox: [${west.toFixed(2)}, ${south.toFixed(2)}, ${east.toFixed(2)}, ${north.toFixed(2)}]`);
 
       // Fetch collection metadata and find timestamp closest to now (rounded down to nearest hour)
-      const collectionMeta = await fetchCollectionMetadata(selectedCollection);
+      const meta = await fetchCollectionMetadata(selectedCollection);
+      collectionMeta = meta;
       const now = new Date();
       const nowHourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), 0, 0, 0);
 
       // Find the closest available timestamp that's <= now (rounded down)
       let bestTimestamp: string | null = null;
       let bestDiff = Infinity;
-      for (const ts of collectionMeta.availableTimestamps) {
+      for (const ts of meta.availableTimestamps) {
         const tsDate = new Date(ts);
         // Only consider timestamps at or before the current hour
         if (tsDate <= nowHourStart) {
@@ -1079,30 +1392,26 @@
         }
       }
       // Fallback to first available if none found before now
-      const selectedTimestamp = bestTimestamp ?? collectionMeta.availableTimestamps[0] ?? null;
+      const selectedTimestamp = bestTimestamp ?? meta.availableTimestamps[0] ?? null;
 
-      // Omit width/height to get native grid resolution from server
-      // This avoids resampling artifacts and alignment issues
-      currentTile = await fetchDataTile({
-        parameter: selectedParameter,
-        collection: selectedCollection,
-        // width/height omitted - server returns native grid resolution
-        bbox: { west, south, east, north },
-        datetime: selectedTimestamp ?? undefined,
-        z: selectedVerticalLevel ?? undefined,
-        crs: selectedCRS,
-      });
-      
-      // Extract grayscale data for re-coloring
-      const canvas = document.createElement('canvas');
-      canvas.width = currentTile.image.width;
-      canvas.height = currentTile.image.height;
-      imageWidth = canvas.width;
-      imageHeight = canvas.height;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(currentTile.image, 0, 0);
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      grayscaleData = new Uint8ClampedArray(imgData.data);
+      // Determine if we should use tiled loading
+      // Regional models (HRRR, MRMS) have coverage issues with tiling - use single request
+      const isRegionalModel = selectedCollection.toLowerCase().includes('hrrr') || 
+                              selectedCollection.toLowerCase().includes('mrms') ||
+                              selectedCollection.toLowerCase().includes('nbm') ||
+                              selectedCollection.toLowerCase().includes('ndfd');
+      const shouldUseTiles = useTiledLoading && !isRegionalModel;
+
+      if (shouldUseTiles) {
+        // TILE-BASED LOADING (for global models like GFS)
+        await loadWeatherDataTiled(west, south, east, north, mapZoom, selectedTimestamp);
+      } else {
+        // SINGLE REQUEST LOADING (for regional models or when tiled loading disabled)
+        if (isRegionalModel && useTiledLoading) {
+          console.log(`Using single-request mode for regional model: ${selectedCollection}`);
+        }
+        await loadWeatherDataSingle(west, south, east, north, selectedTimestamp);
+      }
       
       // Calculate actual min/max from pixel data
       calculateActualMinMax();
@@ -1116,19 +1425,6 @@
       if (markers.length > 0) {
         updateMarkerValues();
       }
-
-      console.log(`Weather data loaded: ${imageWidth}x${imageHeight} (native grid), range: ${currentTile.metadata.min.toFixed(1)} - ${currentTile.metadata.max.toFixed(1)} ${currentTile.metadata.units}`);
-      console.log(`Requested bbox: [${west.toFixed(4)}, ${south.toFixed(4)}, ${east.toFixed(4)}, ${north.toFixed(4)}]`);
-      console.log(`Server returned bbox: [${currentTile.metadata.bbox.map(v => v.toFixed(4)).join(', ')}]`);
-
-      // Calculate pixel size in degrees (for debugging)
-      const [bboxWest, bboxSouth, bboxEast, bboxNorth] = currentTile.metadata.bbox;
-      const pixelWidthDeg = (bboxEast - bboxWest) / imageWidth;
-      const pixelHeightDeg = (bboxNorth - bboxSouth) / imageHeight;
-      console.log(`Pixel size: ${pixelWidthDeg.toFixed(4)}° x ${pixelHeightDeg.toFixed(4)}° (${(pixelWidthDeg * 111).toFixed(1)}km x ${(pixelHeightDeg * 111).toFixed(1)}km at equator)`);
-
-      // Update last loaded bbox to prevent unnecessary refetches on small pans
-      lastLoadedBbox = { west: bboxWest, south: bboxSouth, east: bboxEast, north: bboxNorth };
 
     } catch (err) {
       error = `Failed to load weather data: ${err instanceof Error ? err.message : "Unknown error"}`;
@@ -1396,6 +1692,7 @@
       zoom: initialZoom,
       minZoom: 3,
       maxZoom: 16,
+      fadeDuration: 0,  // Disable symbol fade transitions (reduces label flickering)
       // Disable interactivity in compact mode
       interactive: !compact,
       dragPan: !compact,
@@ -2265,16 +2562,18 @@
       const animationMode = layerConfig?.animation.mode ?? 'recent';
 
       // Fetch collection metadata to get available timestamps
-      const collectionMeta = await fetchCollectionMetadata(selectedCollection);
+      const animMeta = await fetchCollectionMetadata(selectedCollection);
+      collectionMeta = animMeta;  // Update shared state for UI display
 
       // Select timestamps based on config
-      console.log(`Available timestamps: ${collectionMeta.availableTimestamps.length}, frameCount: ${animationFrameCount}, mode: ${animationMode}`);
+      console.log(`Available timestamps: ${animMeta.availableTimestamps.length}, frameCount: ${animationFrameCount}, mode: ${animationMode}`);
       const timestamps = selectAnimationTimestamps(
-        collectionMeta,
+        animMeta,
         animationFrameCount,
         skipFactor,
         animationMode
       );
+      animationFrameTimestamps = timestamps;  // Store for UI display
 
       if (timestamps.length === 0) {
         throw new Error('No timestamps available for animation');
@@ -2680,6 +2979,32 @@
     }
   }
 
+  /** Format a date compactly for extent display: "Feb 06 12Z" */
+  function formatDateCompact(isoString: string): string {
+    try {
+      const date = new Date(isoString);
+      const month = date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+      const day = String(date.getUTCDate()).padStart(2, '0');
+      const hour = String(date.getUTCHours()).padStart(2, '0');
+      return `${month} ${day} ${hour}Z`;
+    } catch {
+      return isoString;
+    }
+  }
+
+  /** Format a model run time: "06Z Feb 06" */
+  function formatRunTime(isoString: string): string {
+    try {
+      const date = new Date(isoString);
+      const month = date.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
+      const day = String(date.getUTCDate()).padStart(2, '0');
+      const hour = String(date.getUTCHours()).padStart(2, '0');
+      return `${hour}Z ${month} ${day}`;
+    } catch {
+      return isoString;
+    }
+  }
+
   // ============================================================
   // MARKER FUNCTIONS
   // ============================================================
@@ -2705,9 +3030,25 @@
       return null;
     }
 
-    // Convert lat/lng to pixel coordinates
-    const xNorm = (lng - west) / (east - west);
-    const yNorm = (north - lat) / (north - south); // Flip Y since image is top-down
+    let xNorm: number;
+    let yNorm: number;
+
+    if (isMercatorProjected) {
+      // Data is in EPSG:3857 (Web Mercator) - need Mercator Y conversion
+      // X is still linear
+      xNorm = (lng - west) / (east - west);
+      
+      // Convert lat to Mercator Y, then normalize
+      const latToMercY = (lat: number) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2));
+      const mercYPoint = latToMercY(lat);
+      const mercYNorth = latToMercY(north);
+      const mercYSouth = latToMercY(south);
+      yNorm = (mercYNorth - mercYPoint) / (mercYNorth - mercYSouth); // Flip Y since image is top-down
+    } else {
+      // Data is in CRS:84 (geographic) - linear mapping
+      xNorm = (lng - west) / (east - west);
+      yNorm = (north - lat) / (north - south); // Flip Y since image is top-down
+    }
 
     const x = Math.floor(xNorm * width);
     const y = Math.floor(yNorm * height);
@@ -2723,7 +3064,7 @@
     // Convert to actual data value
     const dataValue = metadata.min + (grayscaleValue / 255) * (metadata.max - metadata.min);
 
-    console.log(`Sample at (${lng.toFixed(4)}, ${lat.toFixed(4)}): pixel(${clampedX}, ${clampedY}), gray=${grayscaleValue}, value=${dataValue.toFixed(1)}, bbox=[${west.toFixed(2)},${south.toFixed(2)},${east.toFixed(2)},${north.toFixed(2)}], size=${width}x${height}`);
+    console.log(`Sample at (${lng.toFixed(4)}, ${lat.toFixed(4)}): pixel(${clampedX}, ${clampedY}), gray=${grayscaleValue}, value=${dataValue.toFixed(1)}, bbox=[${west.toFixed(2)},${south.toFixed(2)},${east.toFixed(2)},${north.toFixed(2)}], size=${width}x${height}, mercator=${isMercatorProjected}`);
 
     return dataValue;
   }
@@ -3547,6 +3888,53 @@
   {/if}
   
   {#if !compact}
+    {#if collectionMeta}
+    <div class="map-view__temporal-extent">
+      <div class="map-view__temporal-extent-content">
+        {#if collectionMeta.latestRun}
+          <span class="map-view__temporal-run" title="Latest model run">
+            Run: {formatRunTime(collectionMeta.latestRun.runTime)}
+          </span>
+          <span class="map-view__temporal-sep">|</span>
+          <span class="map-view__temporal-range" title="Valid time range for latest run">
+            {formatDateCompact(collectionMeta.latestRun.validStart)} - {formatDateCompact(collectionMeta.latestRun.validEnd)}
+          </span>
+          <span class="map-view__temporal-sep">|</span>
+          <span class="map-view__temporal-hours" title="Number of forecast hours available">
+            {collectionMeta.latestRun.forecastHours.length} hrs loaded (F{collectionMeta.latestRun.forecastHours[0] ?? 0}-F{collectionMeta.latestRun.forecastHours[collectionMeta.latestRun.forecastHours.length - 1] ?? '?'})
+          </span>
+        {:else}
+          <span class="map-view__temporal-range" title="Available time range">
+            {formatDateCompact(collectionMeta.temporalExtent.start)} - {formatDateCompact(collectionMeta.temporalExtent.end)}
+          </span>
+        {/if}
+        <span class="map-view__temporal-sep">|</span>
+        <span class="map-view__temporal-count" title="Total available timestamps across all runs">
+          {collectionMeta.availableTimestamps.length} total steps
+        </span>
+        {#if animationFrameTimestamps.length > 0}
+          <span class="map-view__temporal-sep">|</span>
+          <span class="map-view__temporal-frames" title="Loaded animation frame range">
+            Frames: {formatDateCompact(animationFrameTimestamps[0])} - {formatDateCompact(animationFrameTimestamps[animationFrameTimestamps.length - 1])}
+          </span>
+        {/if}
+      </div>
+      {#if collectionMeta.runs && collectionMeta.runs.length > 1}
+        <details class="map-view__temporal-runs-details">
+          <summary class="map-view__temporal-runs-summary">{collectionMeta.runs.length} runs</summary>
+          <div class="map-view__temporal-runs-list">
+            {#each collectionMeta.runs as run}
+              <div class="map-view__temporal-run-item" class:map-view__temporal-run-item--latest={run === collectionMeta.latestRun}>
+                <span class="map-view__temporal-run-time">{formatRunTime(run.runTime)}</span>
+                <span class="map-view__temporal-run-range">{formatDateCompact(run.validStart)} - {formatDateCompact(run.validEnd)}</span>
+                <span class="map-view__temporal-run-fhrs">F{run.forecastHours[0] ?? 0}-F{run.forecastHours[run.forecastHours.length - 1] ?? '?'} ({run.forecastHours.length}h)</span>
+              </div>
+            {/each}
+          </div>
+        </details>
+      {/if}
+    </div>
+    {/if}
     <div class="map-view__animation-bar" class:map-view__animation-bar--disabled={!mapLocked}>
       <div class="map-view__animation-controls">
         <button
@@ -3722,7 +4110,7 @@
       </div>
       
       <div class="map-view__setting">
-        <label for="isoline-interval">Interval: {temperatureUnit === 'F' ? (isolineInterval * 1.8).toFixed(0) + '°F' : isolineInterval.toFixed(1) + '°C'}</label>
+        <label for="isoline-interval">Interval: {getIntervalDisplayLabel()}</label>
         <input type="range" id="isoline-interval" min="0.5" max="10" step="0.5" value={isolineInterval} oninput={updateIsolineInterval} />
       </div>
       
@@ -4919,6 +5307,109 @@
     border: none;
     border-radius: 50%;
     cursor: pointer;
+  }
+
+  /* Temporal Extent Info Strip */
+  .map-view__temporal-extent {
+    position: absolute;
+    bottom: calc(var(--spacing-md) + 52px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(20, 20, 20, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(8px);
+    z-index: 10;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.75);
+    max-width: 90vw;
+  }
+
+  .map-view__temporal-extent-content {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    flex-wrap: wrap;
+    white-space: nowrap;
+  }
+
+  .map-view__temporal-sep {
+    color: rgba(255, 255, 255, 0.25);
+    user-select: none;
+  }
+
+  .map-view__temporal-run {
+    color: rgb(78, 179, 211);
+    font-weight: 600;
+  }
+
+  .map-view__temporal-range {
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .map-view__temporal-hours {
+    color: rgba(255, 255, 255, 0.6);
+  }
+
+  .map-view__temporal-count {
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .map-view__temporal-frames {
+    color: rgb(129, 211, 78);
+    font-weight: 500;
+  }
+
+  .map-view__temporal-runs-details {
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .map-view__temporal-runs-summary {
+    padding: 3px 10px;
+    cursor: pointer;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 10px;
+    user-select: none;
+  }
+
+  .map-view__temporal-runs-summary:hover {
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .map-view__temporal-runs-list {
+    padding: 2px 10px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .map-view__temporal-run-item {
+    display: flex;
+    gap: 10px;
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.5);
+  }
+
+  .map-view__temporal-run-item--latest {
+    color: rgb(78, 179, 211);
+    font-weight: 600;
+  }
+
+  .map-view__temporal-run-time {
+    min-width: 80px;
+  }
+
+  .map-view__temporal-run-range {
+    min-width: 160px;
+  }
+
+  .map-view__temporal-run-fhrs {
+    color: rgba(255, 255, 255, 0.4);
+  }
+
+  .map-view__temporal-run-item--latest .map-view__temporal-run-fhrs {
+    color: rgba(78, 179, 211, 0.7);
   }
 
   /* Animation Control Bar */

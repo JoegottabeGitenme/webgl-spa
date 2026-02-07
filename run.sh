@@ -19,7 +19,7 @@ CMD="${1:-dev}"
 case "$CMD" in
     dev)
         echo "Starting development server..."
-        npm run dev -- --open
+        npm run dev -- --open --port 5174
         ;;
     build)
         echo "Building for production..."
@@ -28,7 +28,7 @@ case "$CMD" in
     preview)
         echo "Previewing production build..."
         npm run build
-        npm run preview -- --open
+        npm run preview -- --open --port 5174
         ;;
     *)
         echo "Usage: $0 [dev|build|preview]"

@@ -7,6 +7,13 @@
  */
 
 import { getEdrBaseUrl, getAuthHeaders, getEdrDepth } from './edr-config';
+import { 
+  type TileCoord, 
+  tileToBboxWGS84, 
+  tileKey as makeTileKey 
+} from '../tiles/tile-utils';
+import { type CachedTile, type TileCache } from '../tiles/TileCache';
+import { renormalizeToGlobalScale } from '../tiles/parameter-scales';
 
 // Re-export config functions for convenience
 export { getEdrBaseUrl, setEdrBaseUrl, getEdrApiKey, setEdrApiKey, getDefaultEdrUrl, getEdrDepth, setEdrDepth, getDefaultDepth } from './edr-config';
@@ -312,6 +319,13 @@ export interface TileMetadata {
   datetime?: string; // ISO 8601 timestamp of the data
 }
 
+export interface ModelRunInfo {
+  runTime: string;          // ISO 8601 model initialization time (e.g., "2026-02-06T12:00:00Z")
+  validStart: string;       // First valid timestamp
+  validEnd: string;         // Last valid timestamp
+  forecastHours: number[];  // Available forecast hours
+}
+
 export interface CollectionMetadata {
   id: string;
   title: string;
@@ -321,6 +335,8 @@ export interface CollectionMetadata {
     end: string;
   };
   parameters: string[];
+  latestRun?: ModelRunInfo;      // Info about the latest model run (if instances available)
+  runs?: ModelRunInfo[];         // All available model runs
 }
 
 /**
@@ -606,6 +622,182 @@ export async function fetchDataTile(
   return { image, metadata };
 }
 
+// ============================================================================
+// TILE-BASED FETCHING
+// ============================================================================
+
+export interface FetchTileByCoordOptions {
+  collection: string;
+  parameter: string;
+  datetime?: string;
+  z?: number;  // vertical level
+  tileSize?: number;  // Pixel size of output tile (default: 512)
+}
+
+// Default tile size for consistent compositing (512 for better resolution)
+const DEFAULT_TILE_SIZE = 512;
+
+/**
+ * Fetch a single weather data tile by XYZ coordinates.
+ * Uses CRS:84 (geographic) projection - client handles reprojection to Mercator.
+ * 
+ * @param tile - Tile coordinates {x, y, z}
+ * @param options - Collection, parameter, datetime, vertical level
+ * @returns DataTile with image and metadata
+ */
+export async function fetchTileByCoord(
+  tile: TileCoord,
+  options: FetchTileByCoordOptions
+): Promise<DataTile> {
+  // Convert tile coords to WGS84 bbox for the POLYGON in the request
+  const bbox = tileToBboxWGS84(tile);
+  const tileSize = options.tileSize ?? DEFAULT_TILE_SIZE;
+  
+  console.log(`Fetching tile ${tile.z}/${tile.x}/${tile.y} (${tileSize}x${tileSize}) bbox: [${bbox.west.toFixed(4)}, ${bbox.south.toFixed(4)}, ${bbox.east.toFixed(4)}, ${bbox.north.toFixed(4)}]`);
+  
+  // Request in CRS:84 (geographic projection)
+  // Client will handle reprojection to Mercator for display
+  return fetchDataTile({
+    collection: options.collection,
+    parameter: options.parameter,
+    width: tileSize,
+    height: tileSize,
+    bbox: {
+      west: bbox.west,
+      south: bbox.south,
+      east: bbox.east,
+      north: bbox.north,
+    },
+    crs: "CRS:84",  // Geographic projection - client reprojects
+    datetime: options.datetime,
+    z: options.z,
+  });
+}
+
+/**
+ * Extract grayscale data from an HTMLImageElement.
+ * Returns RGBA array where R=G=B=grayscale value.
+ */
+function extractGrayscaleData(image: HTMLImageElement): Uint8ClampedArray {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(image, 0, 0);
+  return new Uint8ClampedArray(ctx.getImageData(0, 0, image.width, image.height).data);
+}
+
+/**
+ * Convert a DataTile to a CachedTile for the tile cache.
+ * Optionally renormalizes data to global fixed scale.
+ */
+function dataTileToCachedTile(
+  dataTile: DataTile,
+  parameter: string,
+  useGlobalScale: boolean = true
+): CachedTile {
+  let grayscaleData = extractGrayscaleData(dataTile.image);
+  
+  // Renormalize to global fixed scale if requested
+  if (useGlobalScale) {
+    grayscaleData = renormalizeToGlobalScale(
+      grayscaleData,
+      dataTile.metadata.min,
+      dataTile.metadata.max,
+      parameter
+    );
+  }
+  
+  return {
+    grayscaleData,
+    width: dataTile.image.width,
+    height: dataTile.image.height,
+    bbox: dataTile.metadata.bbox,
+    dataMin: dataTile.metadata.min,
+    dataMax: dataTile.metadata.max,
+    units: dataTile.metadata.units,
+    fetchedAt: Date.now(),
+    lastAccess: Date.now(),
+  };
+}
+
+export interface FetchTilesOptions extends FetchTileByCoordOptions {
+  useGlobalScale?: boolean;  // Renormalize to global fixed scale (default: true)
+}
+
+export interface FetchTilesResult {
+  tiles: Map<string, CachedTile>;
+  errors: Map<string, Error>;
+}
+
+/**
+ * Fetch multiple tiles in parallel with caching.
+ * Checks cache first, only fetches missing tiles.
+ * 
+ * @param tileCoords - Array of tile coordinates to fetch
+ * @param cache - Tile cache instance
+ * @param options - Fetch options
+ * @returns Map of tile keys to cached tiles, plus any errors
+ */
+export async function fetchTiles(
+  tileCoords: TileCoord[],
+  cache: TileCache,
+  options: FetchTilesOptions
+): Promise<FetchTilesResult> {
+  const { collection, parameter, datetime, z, tileSize, useGlobalScale = true } = options;
+  
+  const results = new Map<string, CachedTile>();
+  const errors = new Map<string, Error>();
+  const toFetch: TileCoord[] = [];
+  
+  // Check cache first
+  for (const tile of tileCoords) {
+    const key = makeTileKey(tile, datetime, parameter, collection);
+    const cached = cache.get(key);
+    if (cached) {
+      results.set(key, cached);
+    } else {
+      toFetch.push(tile);
+    }
+  }
+  
+  console.log(`Tile fetch: ${results.size} cached, ${toFetch.length} to fetch`);
+  
+  if (toFetch.length === 0) {
+    return { tiles: results, errors };
+  }
+  
+  // Fetch missing tiles in parallel
+  const fetchPromises = toFetch.map(async (tile) => {
+    const key = makeTileKey(tile, datetime, parameter, collection);
+    try {
+      const dataTile = await fetchTileByCoord(tile, { collection, parameter, datetime, z, tileSize });
+      const cachedTile = dataTileToCachedTile(dataTile, parameter, useGlobalScale);
+      
+      // Store in cache
+      cache.set(key, cachedTile);
+      
+      return { key, tile: cachedTile, error: null };
+    } catch (err) {
+      console.error(`Failed to fetch tile ${key}:`, err);
+      return { key, tile: null, error: err as Error };
+    }
+  });
+  
+  const fetchResults = await Promise.all(fetchPromises);
+  
+  // Collect results and errors
+  for (const result of fetchResults) {
+    if (result.tile) {
+      results.set(result.key, result.tile);
+    } else if (result.error) {
+      errors.set(result.key, result.error);
+    }
+  }
+  
+  return { tiles: results, errors };
+}
+
 /**
  * Convert a raw pixel value (0-255) to the actual data value
  *
@@ -651,7 +843,7 @@ export async function fetchCollectionMetadata(
   // Extract parameter names
   const parameters = Object.keys(data.parameter_names ?? {});
   
-  return {
+  const result: CollectionMetadata = {
     id: data.id,
     title: data.title ?? data.id,
     availableTimestamps: timestamps,
@@ -661,6 +853,56 @@ export async function fetchCollectionMetadata(
     },
     parameters,
   };
+
+  // Try to fetch instance data (model runs) for richer temporal info
+  // This is non-critical, so we don't fail if it errors
+  try {
+    const runs = await fetchCollectionInstances(collection);
+    if (runs.length > 0) {
+      result.latestRun = runs[0]; // First is most recent
+      result.runs = runs;
+    }
+  } catch (e) {
+    console.warn(`Could not fetch instances for ${collection}:`, e);
+  }
+
+  return result;
+}
+
+/**
+ * Fetch available model run instances for a collection
+ * Returns runs sorted newest first
+ */
+export async function fetchCollectionInstances(
+  collection: string
+): Promise<ModelRunInfo[]> {
+  const url = `${getEdrBaseUrl()}/edr/collections/${collection}/instances`;
+  
+  const response = await authFetch(url);
+  
+  if (!response.ok) {
+    // Not all collections support instances (e.g., MRMS)
+    if (response.status === 404) return [];
+    throw new Error(
+      `Failed to fetch collection instances: ${response.status} ${response.statusText}`
+    );
+  }
+  
+  const data = await response.json();
+  const instances = data.instances ?? [];
+  
+  return instances.map((inst: any) => {
+    const temporal = inst.extent?.temporal;
+    const interval = temporal?.interval?.[0] ?? [null, null];
+    const forecastHourExtent = inst.extent?.custom?.find((c: any) => c.id === 'forecast-hour');
+    
+    return {
+      runTime: inst.id,  // Instance ID is the run time
+      validStart: interval[0] ?? '',
+      validEnd: interval[1] ?? '',
+      forecastHours: forecastHourExtent?.values ?? [],
+    } as ModelRunInfo;
+  });
 }
 
 /**
