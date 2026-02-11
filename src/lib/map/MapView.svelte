@@ -26,6 +26,8 @@
     type TileMetadata,
     type CollectionSummary,
     type CollectionMetadata,
+    fetchMetarStations,
+    type MetarFeatureCollection,
   } from "../data/edr-client";
   import {
     COLOR_SCALES,
@@ -271,6 +273,13 @@
   // Per-frame load status for tick indicators on scrubber
   let frameStatuses = $state<Map<string, FrameStatus>>(new Map());
 
+  // METAR overlay state
+  let metarEnabled = $state(false);
+  let metarLoading = $state(false);
+  let metarData = $state<MetarFeatureCollection | null>(null);
+  let metarRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let metarPopup: maplibregl.Popup | null = null;
+
   // Marker state
   interface TimeSeriesPoint {
     timestamp: string;
@@ -399,6 +408,12 @@
   // Animation layer source/layer ID prefix
   const ANIM_SOURCE_PREFIX = 'weather-anim-src-';
   const ANIM_LAYER_PREFIX = 'weather-anim-layer-';
+
+  // METAR layer source/layer IDs
+  const METAR_SOURCE_ID = 'metar-stations';
+  const METAR_CIRCLE_LAYER_ID = 'metar-circles';
+  const METAR_LABEL_LAYER_ID = 'metar-labels';
+  const METAR_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
   /**
    * Apply pixel offset correction to bbox for proper image alignment.
@@ -1634,6 +1649,10 @@
         event.preventDefault();
         handleIsolineToggle();
         break;
+      case 'o':
+        event.preventDefault();
+        handleMetarToggle();
+        break;
       case 'u':
         event.preventDefault();
         mapLocked = !mapLocked;
@@ -1805,6 +1824,10 @@
     }
     windLayer = null;
     
+    // Clean up METAR layers
+    stopMetarRefresh();
+    removeMetarLayers();
+
     // Clean up vector contours and labels
     if (map?.getLayer(CONTOUR_LABELS_ID)) {
       try { map.removeLayer(CONTOUR_LABELS_ID); } catch (e) {}
@@ -2565,6 +2588,321 @@
     // Show the main weather layer again
     if (map.getLayer(WEATHER_LAYER_ID)) {
       map.setLayoutProperty(WEATHER_LAYER_ID, 'visibility', 'visible');
+    }
+  }
+
+  // ===========================================================================
+  // METAR Station Overlay
+  // ===========================================================================
+
+  /**
+   * Format a METAR observation time for display (e.g., "Feb 11 02:53Z")
+   */
+  function formatMetarTime(isoTime: string): string {
+    const d = new Date(isoTime);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const mon = months[d.getUTCMonth()];
+    const day = d.getUTCDate();
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mm = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${mon} ${day} ${hh}:${mm}Z`;
+  }
+
+  /**
+   * Convert Kelvin to display temperature string based on user preference
+   */
+  function metarTempDisplay(kelvin: number): string {
+    if (temperatureUnit === 'F') {
+      return `${((kelvin - 273.15) * 9/5 + 32).toFixed(0)}°F`;
+    }
+    return `${(kelvin - 273.15).toFixed(0)}°C`;
+  }
+
+  /**
+   * Convert m/s to knots
+   */
+  function msToKnots(ms: number): number {
+    return Math.round(ms * 1.94384);
+  }
+
+  /**
+   * Convert meters to statute miles
+   */
+  function metersToSM(m: number): string {
+    const sm = m / 1609.344;
+    if (sm >= 10) return `${Math.round(sm)} SM`;
+    if (sm >= 1) return `${sm.toFixed(1)} SM`;
+    return `${sm.toFixed(2)} SM`;
+  }
+
+  /**
+   * Convert Pascals to inches of mercury
+   */
+  function paToInHg(pa: number): string {
+    return (pa / 3386.39).toFixed(2);
+  }
+
+  /**
+   * Get the short temperature label for map display (e.g., "42°")
+   */
+  function metarTempLabel(kelvin: number): string {
+    if (temperatureUnit === 'F') {
+      return `${((kelvin - 273.15) * 9/5 + 32).toFixed(0)}°`;
+    }
+    return `${(kelvin - 273.15).toFixed(0)}°`;
+  }
+
+  /**
+   * Load METAR station data and update the map layer
+   */
+  async function loadMetarData() {
+    if (!map) return;
+    metarLoading = true;
+
+    try {
+      const data = await fetchMetarStations();
+
+      // Add display_temp property for the symbol layer text-field
+      for (const feature of data.features) {
+        (feature.properties as Record<string, unknown>).display_temp =
+          metarTempLabel(feature.properties.temperature_k);
+      }
+
+      metarData = data;
+
+      // Update or create the source
+      const source = map.getSource(METAR_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(data as unknown as GeoJSON.FeatureCollection);
+      } else {
+        setupMetarLayers(data);
+      }
+
+      console.log(`[METAR] Loaded ${data.features.length} stations`);
+    } catch (error) {
+      console.error('[METAR] Failed to load:', error);
+    } finally {
+      metarLoading = false;
+    }
+  }
+
+  /**
+   * Set up MapLibre source and layers for METAR stations
+   */
+  function setupMetarLayers(data: MetarFeatureCollection) {
+    if (!map) return;
+
+    // Add GeoJSON source
+    map.addSource(METAR_SOURCE_ID, {
+      type: 'geojson',
+      data: data as unknown as GeoJSON.FeatureCollection,
+    });
+
+    // Circle layer: colored by flight category
+    map.addLayer({
+      id: METAR_CIRCLE_LAYER_ID,
+      type: 'circle',
+      source: METAR_SOURCE_ID,
+      paint: {
+        'circle-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 4,
+          6, 6,
+          10, 8,
+        ],
+        'circle-color': [
+          'match', ['get', 'flight_category'],
+          'VFR', '#00cc44',
+          'MVFR', '#3388ff',
+          'IFR', '#dd2222',
+          'LIFR', '#cc00cc',
+          '#888888' // fallback
+        ],
+        'circle-stroke-width': 1.5,
+        'circle-stroke-color': 'rgba(255, 255, 255, 0.8)',
+        'circle-opacity': 0.9,
+      },
+    });
+
+    // Symbol layer: temperature label
+    map.addLayer({
+      id: METAR_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: METAR_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'display_temp'],
+        'text-size': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 9,
+          6, 11,
+          10, 13,
+        ],
+        'text-offset': [0, -1.4],
+        'text-anchor': 'bottom',
+        'text-allow-overlap': false,
+        'text-ignore-placement': false,
+        'text-optional': true,
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+      },
+      paint: {
+        'text-color': '#ffffff',
+        'text-halo-color': 'rgba(0, 0, 0, 0.8)',
+        'text-halo-width': 1.5,
+      },
+      minzoom: 4,
+    });
+
+    // Click handler for METAR circles
+    map.on('click', METAR_CIRCLE_LAYER_ID, handleMetarClick);
+
+    // Change cursor on hover
+    map.on('mouseenter', METAR_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = 'pointer';
+    });
+    map.on('mouseleave', METAR_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = '';
+    });
+  }
+
+  /**
+   * Handle click on a METAR station circle to show popup
+   */
+  function handleMetarClick(e: maplibregl.MapLayerMouseEvent) {
+    if (!map || !e.features || e.features.length === 0) return;
+
+    const feature = e.features[0];
+    const props = feature.properties as Record<string, unknown>;
+    const coords = (feature.geometry as GeoJSON.Point).coordinates as [number, number];
+
+    const stationId = props.location_id as string;
+    const name = props.name as string;
+    const obsTime = props.obs_time as string;
+    const tempK = props.temperature_k as number;
+    const dewK = props.dewpoint_k as number;
+    const windDir = props.wind_direction_deg as number;
+    const windSpd = props.wind_speed_ms as number;
+    const windGust = props.wind_gust_ms as number | undefined;
+    const visM = props.visibility_m as number;
+    const altPa = props.altimeter_pa as number;
+    const slpPa = props.sea_level_pressure_pa as number | undefined;
+    const flightCat = props.flight_category as string;
+    const rawText = props.raw_text as string;
+
+    // Flight category color
+    const catColors: Record<string, string> = {
+      VFR: '#00cc44', MVFR: '#3388ff', IFR: '#dd2222', LIFR: '#cc00cc'
+    };
+    const catColor = catColors[flightCat] ?? '#888';
+
+    // Build wind string
+    let windStr = `${windDir}° at ${msToKnots(windSpd)} kt`;
+    if (windGust && windGust > 0) {
+      windStr += `, gusting ${msToKnots(windGust)} kt`;
+    }
+
+    // Build SLP line
+    const slpLine = slpPa
+      ? `<div class="metar-popup__row"><span class="metar-popup__label">SLP</span><span>${(slpPa / 100).toFixed(1)} hPa</span></div>`
+      : '';
+
+    const html = `
+      <div class="metar-popup">
+        <div class="metar-popup__header">
+          <strong>${stationId}</strong> <span class="metar-popup__name">${name}</span>
+        </div>
+        <div class="metar-popup__category" style="background:${catColor}">${flightCat}</div>
+        <div class="metar-popup__data">
+          <div class="metar-popup__row"><span class="metar-popup__label">Temp</span><span>${metarTempDisplay(tempK)}</span></div>
+          <div class="metar-popup__row"><span class="metar-popup__label">Dewpoint</span><span>${metarTempDisplay(dewK)}</span></div>
+          <div class="metar-popup__row"><span class="metar-popup__label">Wind</span><span>${windStr}</span></div>
+          <div class="metar-popup__row"><span class="metar-popup__label">Visibility</span><span>${metersToSM(visM)}</span></div>
+          <div class="metar-popup__row"><span class="metar-popup__label">Altimeter</span><span>${paToInHg(altPa)} inHg</span></div>
+          ${slpLine}
+        </div>
+        <div class="metar-popup__raw">${rawText}</div>
+        <div class="metar-popup__time">${formatMetarTime(obsTime)}</div>
+      </div>
+    `;
+
+    // Remove existing popup
+    metarPopup?.remove();
+
+    metarPopup = new maplibregl.Popup({
+      closeButton: true,
+      closeOnClick: true,
+      maxWidth: '320px',
+      className: 'metar-popup-container',
+    })
+      .setLngLat(coords)
+      .setHTML(html)
+      .addTo(map);
+  }
+
+  /**
+   * Remove METAR layers and source from the map
+   */
+  function removeMetarLayers() {
+    if (!map) return;
+
+    // Remove event listeners
+    map.off('click', METAR_CIRCLE_LAYER_ID, handleMetarClick);
+
+    // Remove layers
+    if (map.getLayer(METAR_LABEL_LAYER_ID)) {
+      try { map.removeLayer(METAR_LABEL_LAYER_ID); } catch (e) {}
+    }
+    if (map.getLayer(METAR_CIRCLE_LAYER_ID)) {
+      try { map.removeLayer(METAR_CIRCLE_LAYER_ID); } catch (e) {}
+    }
+    if (map.getSource(METAR_SOURCE_ID)) {
+      try { map.removeSource(METAR_SOURCE_ID); } catch (e) {}
+    }
+
+    // Remove popup
+    metarPopup?.remove();
+    metarPopup = null;
+  }
+
+  /**
+   * Start the METAR auto-refresh timer
+   */
+  function startMetarRefresh() {
+    stopMetarRefresh();
+    metarRefreshTimer = setInterval(() => {
+      if (metarEnabled && !metarLoading) {
+        console.log('[METAR] Auto-refreshing...');
+        loadMetarData();
+      }
+    }, METAR_REFRESH_INTERVAL);
+  }
+
+  /**
+   * Stop the METAR auto-refresh timer
+   */
+  function stopMetarRefresh() {
+    if (metarRefreshTimer) {
+      clearInterval(metarRefreshTimer);
+      metarRefreshTimer = null;
+    }
+  }
+
+  /**
+   * Toggle METAR station overlay on/off
+   */
+  async function handleMetarToggle() {
+    if (metarEnabled) {
+      // Disable
+      metarEnabled = false;
+      removeMetarLayers();
+      stopMetarRefresh();
+      metarData = null;
+      console.log('[METAR] Disabled');
+    } else {
+      // Enable
+      metarEnabled = true;
+      await loadMetarData();
+      startMetarRefresh();
+      console.log('[METAR] Enabled with auto-refresh');
     }
   }
 
@@ -3904,6 +4242,24 @@
     {/if}
 
     <button
+      class="map-view__metar-toggle"
+      class:map-view__metar-toggle--active={metarEnabled}
+      onclick={handleMetarToggle}
+      disabled={metarLoading}
+      title={metarEnabled ? "Hide METARs" : "Show METARs"}
+    >
+      {#if metarLoading}
+        <span class="map-view__wind-spinner"></span>
+      {:else}
+        <svg class="map-view__metar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 2v4m0 12v4m10-10h-4M6 12H2m15.07-7.07l-2.83 2.83M9.76 14.24l-2.83 2.83m11.14 0l-2.83-2.83M9.76 9.76L6.93 6.93" stroke-linecap="round"/>
+        </svg>
+      {/if}
+      <span>METARs <kbd>O</kbd></span>
+    </button>
+
+    <button
       class="map-view__lock-toggle"
       class:map-view__lock-toggle--locked={mapLocked}
       onclick={() => mapLocked = !mapLocked}
@@ -4312,6 +4668,10 @@
               <tr>
                 <td><kbd>I</kbd></td>
                 <td>Toggle isoline (contour) layer</td>
+              </tr>
+              <tr>
+                <td><kbd>O</kbd></td>
+                <td>Toggle METAR station overlay</td>
               </tr>
               <tr>
                 <td><kbd>R</kbd></td>
@@ -5026,6 +5386,50 @@
   }
 
   .map-view__isoline-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .map-view__metar-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(4px);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .map-view__metar-toggle kbd {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    opacity: 0.7;
+  }
+
+  .map-view__metar-toggle:hover:not(:disabled) {
+    border-color: var(--color-accent);
+    color: white;
+  }
+
+  .map-view__metar-toggle:disabled {
+    cursor: wait;
+    opacity: 0.7;
+  }
+
+  .map-view__metar-toggle--active {
+    background: rgba(255, 170, 0, 0.3);
+    border-color: rgb(255, 170, 0);
+    color: white;
+  }
+
+  .map-view__metar-icon {
     width: 16px;
     height: 16px;
   }
@@ -5825,5 +6229,100 @@
     font-weight: 600;
     color: white;
     font-family: monospace;
+  }
+
+  /* METAR popup styles (global because MapLibre popups are outside component scope) */
+  :global(.metar-popup-container .maplibregl-popup-content) {
+    background: rgba(20, 20, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    padding: 0;
+    color: white;
+    font-size: 13px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+
+  :global(.metar-popup-container .maplibregl-popup-close-button) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 18px;
+    padding: 4px 8px;
+  }
+
+  :global(.metar-popup-container .maplibregl-popup-close-button:hover) {
+    color: white;
+    background: transparent;
+  }
+
+  :global(.metar-popup-container .maplibregl-popup-tip) {
+    border-top-color: rgba(20, 20, 30, 0.95);
+  }
+
+  :global(.metar-popup) {
+    padding: 10px 12px;
+    min-width: 220px;
+  }
+
+  :global(.metar-popup__header) {
+    font-size: 14px;
+    margin-bottom: 6px;
+    padding-right: 16px;
+  }
+
+  :global(.metar-popup__header strong) {
+    font-size: 15px;
+    color: rgb(78, 179, 211);
+  }
+
+  :global(.metar-popup__name) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
+  :global(.metar-popup__category) {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+
+  :global(.metar-popup__data) {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 8px;
+  }
+
+  :global(.metar-popup__row) {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  :global(.metar-popup__label) {
+    color: rgba(255, 255, 255, 0.5);
+    flex-shrink: 0;
+  }
+
+  :global(.metar-popup__raw) {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    background: rgba(0, 0, 0, 0.3);
+    padding: 6px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    line-height: 1.4;
+    margin-bottom: 6px;
+  }
+
+  :global(.metar-popup__time) {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: right;
   }
 </style>

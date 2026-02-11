@@ -4137,3 +4137,91 @@ export async function fetchPositionTimeSeries(
     return [];
   }
 }
+
+// =============================================================================
+// METAR Station Observations
+// =============================================================================
+
+/**
+ * Properties for a single METAR observation from the EDR API
+ */
+export interface MetarProperties {
+  location_id: string;
+  name: string;
+  obs_time: string;
+  temperature_k: number;
+  dewpoint_k: number;
+  wind_direction_deg: number;
+  wind_speed_ms: number;
+  wind_gust_ms?: number;
+  visibility_m: number;
+  altimeter_pa: number;
+  sea_level_pressure_pa?: number;
+  flight_category: 'VFR' | 'MVFR' | 'IFR' | 'LIFR';
+  raw_text: string;
+}
+
+/**
+ * GeoJSON Feature with METAR properties
+ */
+export interface MetarFeature {
+  type: 'Feature';
+  id: string;
+  geometry: {
+    type: 'Point';
+    coordinates: [number, number]; // [lng, lat]
+  };
+  properties: MetarProperties;
+}
+
+/**
+ * GeoJSON FeatureCollection of METAR observations
+ */
+export interface MetarFeatureCollection {
+  type: 'FeatureCollection';
+  features: MetarFeature[];
+}
+
+/**
+ * Fetch latest METAR observations for all stations.
+ * Uses a radius query centered on CONUS with a large radius to get all 77 stations.
+ * Deduplicates by location_id, keeping only the most recent observation per station.
+ */
+export async function fetchMetarStations(): Promise<MetarFeatureCollection> {
+  const baseUrl = getEdrBaseUrl();
+  // Center on CONUS with a 5000km radius to capture all stations (including Alaska)
+  const url = `${baseUrl}/edr/collections/metar/radius?coords=POINT(-98.0 39.0)&within=5000&within-units=km&limit=1`;
+
+  console.log('[fetchMetarStations] Fetching:', url);
+
+  try {
+    const response = await authFetch(url);
+    if (!response.ok) {
+      console.error(`METAR fetch failed: ${response.status} ${response.statusText}`);
+      return { type: 'FeatureCollection', features: [] };
+    }
+
+    const data = await response.json() as MetarFeatureCollection;
+
+    // Deduplicate: keep only the latest observation per station
+    const latestByStation = new Map<string, MetarFeature>();
+    for (const feature of data.features) {
+      const stationId = feature.properties.location_id;
+      const existing = latestByStation.get(stationId);
+      if (!existing || feature.properties.obs_time > existing.properties.obs_time) {
+        latestByStation.set(stationId, feature);
+      }
+    }
+
+    const deduped: MetarFeatureCollection = {
+      type: 'FeatureCollection',
+      features: Array.from(latestByStation.values()),
+    };
+
+    console.log(`[fetchMetarStations] Got ${deduped.features.length} stations (deduped from ${data.features.length} obs)`);
+    return deduped;
+  } catch (error) {
+    console.error('Error fetching METAR stations:', error);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
