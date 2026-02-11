@@ -28,6 +28,15 @@
     type CollectionMetadata,
     fetchMetarStations,
     type MetarFeatureCollection,
+    fetchBuoyStations,
+    type BuoyFeatureCollection,
+    fetchTafStations,
+    type TafFeatureCollection,
+    type TafPeriod,
+    fetchDartLocations,
+    fetchDartTimeSeries,
+    type DartLocationCollection,
+    type DartObservation,
   } from "../data/edr-client";
   import {
     COLOR_SCALES,
@@ -280,6 +289,26 @@
   let metarRefreshTimer: ReturnType<typeof setInterval> | null = null;
   let metarPopup: maplibregl.Popup | null = null;
 
+  // NDBC buoy overlay state
+  let buoyEnabled = $state(false);
+  let buoyLoading = $state(false);
+  let buoyData = $state<BuoyFeatureCollection | null>(null);
+  let buoyRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let buoyPopup: maplibregl.Popup | null = null;
+
+  // TAF overlay state
+  let tafEnabled = $state(false);
+  let tafLoading = $state(false);
+  let tafData = $state<TafFeatureCollection | null>(null);
+  let tafRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let tafPopup: maplibregl.Popup | null = null;
+
+  // DART overlay state
+  let dartEnabled = $state(false);
+  let dartLoading = $state(false);
+  let dartPopup: maplibregl.Popup | null = null;
+  let dartRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
   // Marker state
   interface TimeSeriesPoint {
     timestamp: string;
@@ -414,6 +443,24 @@
   const METAR_CIRCLE_LAYER_ID = 'metar-circles';
   const METAR_LABEL_LAYER_ID = 'metar-labels';
   const METAR_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+  // NDBC buoy layer source/layer IDs
+  const BUOY_SOURCE_ID = 'buoy-stations';
+  const BUOY_CIRCLE_LAYER_ID = 'buoy-circles';
+  const BUOY_LABEL_LAYER_ID = 'buoy-labels';
+  const BUOY_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+  // TAF layer source/layer IDs
+  const TAF_SOURCE_ID = 'taf-stations';
+  const TAF_CIRCLE_LAYER_ID = 'taf-circles';
+  const TAF_LABEL_LAYER_ID = 'taf-labels';
+  const TAF_REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes (TAFs update less frequently)
+
+  // DART layer source/layer IDs
+  const DART_SOURCE_ID = 'dart-stations';
+  const DART_CIRCLE_LAYER_ID = 'dart-circles';
+  const DART_LABEL_LAYER_ID = 'dart-labels';
+  const DART_REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
 
   /**
    * Apply pixel offset correction to bbox for proper image alignment.
@@ -1653,6 +1700,18 @@
         event.preventDefault();
         handleMetarToggle();
         break;
+      case 'b':
+        event.preventDefault();
+        handleBuoyToggle();
+        break;
+      case 't':
+        event.preventDefault();
+        handleTafToggle();
+        break;
+      case 'g':
+        event.preventDefault();
+        handleDartToggle();
+        break;
       case 'u':
         event.preventDefault();
         mapLocked = !mapLocked;
@@ -1827,6 +1886,18 @@
     // Clean up METAR layers
     stopMetarRefresh();
     removeMetarLayers();
+
+    // Clean up buoy layers
+    stopBuoyRefresh();
+    removeBuoyLayers();
+
+    // Clean up TAF layers
+    stopTafRefresh();
+    removeTafLayers();
+
+    // Clean up DART layers
+    stopDartRefresh();
+    removeDartLayers();
 
     // Clean up vector contours and labels
     if (map?.getLayer(CONTOUR_LABELS_ID)) {
@@ -2903,6 +2974,994 @@
       await loadMetarData();
       startMetarRefresh();
       console.log('[METAR] Enabled with auto-refresh');
+    }
+  }
+
+  // ==========================================================================
+  // NDBC Buoy Station Overlay
+  // ==========================================================================
+
+  /**
+   * Get buoy temperature label for map display.
+   * Prefers water temp, falls back to air temp.
+   */
+  function buoyTempLabel(props: Record<string, unknown>): string {
+    const waterK = props.water_temp_k as number | undefined;
+    const airK = props.temperature_k as number | undefined;
+    const kelvin = waterK ?? airK;
+    if (kelvin == null) return '';
+    if (temperatureUnit === 'F') {
+      return `${((kelvin - 273.15) * 9/5 + 32).toFixed(0)}°`;
+    }
+    return `${(kelvin - 273.15).toFixed(0)}°`;
+  }
+
+  /**
+   * Load NDBC buoy station data and update the map layer
+   */
+  async function loadBuoyData() {
+    if (!map) return;
+    buoyLoading = true;
+
+    try {
+      const data = await fetchBuoyStations();
+
+      // Add display_temp property for the symbol layer text-field
+      for (const feature of data.features) {
+        (feature.properties as unknown as Record<string, unknown>).display_temp =
+          buoyTempLabel(feature.properties as unknown as Record<string, unknown>);
+      }
+
+      buoyData = data;
+
+      // Update or create the source
+      const source = map.getSource(BUOY_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(data as unknown as GeoJSON.FeatureCollection);
+      } else {
+        setupBuoyLayers(data);
+      }
+
+      console.log(`[BUOY] Loaded ${data.features.length} stations`);
+    } catch (error) {
+      console.error('[BUOY] Failed to load:', error);
+    } finally {
+      buoyLoading = false;
+    }
+  }
+
+  /**
+   * Set up MapLibre source and layers for NDBC buoy stations
+   */
+  function setupBuoyLayers(data: BuoyFeatureCollection) {
+    if (!map) return;
+
+    // Add GeoJSON source
+    map.addSource(BUOY_SOURCE_ID, {
+      type: 'geojson',
+      data: data as unknown as GeoJSON.FeatureCollection,
+    });
+
+    // Circle layer: static teal color (no flight category equivalent for buoys)
+    map.addLayer({
+      id: BUOY_CIRCLE_LAYER_ID,
+      type: 'circle',
+      source: BUOY_SOURCE_ID,
+      paint: {
+        'circle-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 3.5,
+          6, 5.5,
+          10, 7.5,
+        ],
+        'circle-color': '#00bcd4',
+        'circle-stroke-width': 1.5,
+        'circle-stroke-color': 'rgba(255, 255, 255, 0.8)',
+        'circle-opacity': 0.9,
+      },
+    });
+
+    // Symbol layer: temperature label (water temp preferred, then air temp)
+    map.addLayer({
+      id: BUOY_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: BUOY_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'display_temp'],
+        'text-size': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 9,
+          6, 11,
+          10, 13,
+        ],
+        'text-offset': [0, -1.4],
+        'text-anchor': 'bottom',
+        'text-allow-overlap': false,
+        'text-ignore-placement': false,
+        'text-optional': true,
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+      },
+      paint: {
+        'text-color': '#b2ebf2',
+        'text-halo-color': 'rgba(0, 0, 0, 0.8)',
+        'text-halo-width': 1.5,
+      },
+      minzoom: 4,
+    });
+
+    // Click handler for buoy circles
+    map.on('click', BUOY_CIRCLE_LAYER_ID, handleBuoyClick);
+
+    // Change cursor on hover
+    map.on('mouseenter', BUOY_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = 'pointer';
+    });
+    map.on('mouseleave', BUOY_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = '';
+    });
+  }
+
+  /**
+   * Handle click on a buoy station circle to show popup
+   */
+  function handleBuoyClick(e: maplibregl.MapLayerMouseEvent) {
+    if (!map || !e.features || e.features.length === 0) return;
+
+    const feature = e.features[0];
+    const props = feature.properties as Record<string, unknown>;
+    const coords = (feature.geometry as GeoJSON.Point).coordinates as [number, number];
+
+    const stationId = props.location_id as string;
+    const name = props.name as string;
+    const obsTime = props.obs_time as string;
+    const airTempK = props.temperature_k as number | undefined;
+    const dewK = props.dewpoint_k as number | undefined;
+    const windDir = props.wind_direction_deg as number | undefined;
+    const windSpd = props.wind_speed_ms as number | undefined;
+    const windGust = props.wind_gust_ms as number | undefined;
+    const slpPa = props.sea_level_pressure_pa as number | undefined;
+    const waterTempK = props.water_temp_k as number | undefined;
+    const waveHeight = props.wave_height_m as number | undefined;
+    const wavePeriod = props.dominant_wave_period_s as number | undefined;
+    const waveDir = props.mean_wave_direction_deg as number | undefined;
+    const visM = props.visibility_m as number | undefined;
+    const rawText = props.raw_text as string | undefined;
+
+    // Build data rows — only show fields that exist
+    let rows = '';
+
+    if (waterTempK != null) {
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Water Temp</span><span>${metarTempDisplay(waterTempK)}</span></div>`;
+    }
+    if (airTempK != null) {
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Air Temp</span><span>${metarTempDisplay(airTempK)}</span></div>`;
+    }
+    if (dewK != null) {
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Dewpoint</span><span>${metarTempDisplay(dewK)}</span></div>`;
+    }
+    if (windSpd != null) {
+      let windStr = '';
+      if (windDir != null) {
+        windStr = `${windDir}° at ${msToKnots(windSpd)} kt`;
+      } else {
+        windStr = `${msToKnots(windSpd)} kt`;
+      }
+      if (windGust != null && windGust > 0) {
+        windStr += `, gusting ${msToKnots(windGust)} kt`;
+      }
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Wind</span><span>${windStr}</span></div>`;
+    }
+    if (waveHeight != null) {
+      let waveStr = `${waveHeight.toFixed(1)} m`;
+      if (wavePeriod != null) {
+        waveStr += ` @ ${wavePeriod.toFixed(0)}s`;
+      }
+      if (waveDir != null) {
+        waveStr += ` from ${waveDir}°`;
+      }
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Waves</span><span>${waveStr}</span></div>`;
+    }
+    if (visM != null) {
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Visibility</span><span>${metersToSM(visM)}</span></div>`;
+    }
+    if (slpPa != null) {
+      rows += `<div class="buoy-popup__row"><span class="buoy-popup__label">Pressure</span><span>${(slpPa / 100).toFixed(1)} hPa</span></div>`;
+    }
+
+    // Display name only if different from station ID
+    const displayName = (name && name !== stationId) ? `<span class="buoy-popup__name">${name}</span>` : '';
+
+    const rawSection = rawText
+      ? `<div class="buoy-popup__raw">${rawText}</div>`
+      : '';
+
+    const html = `
+      <div class="buoy-popup">
+        <div class="buoy-popup__header">
+          <strong>${stationId}</strong> ${displayName}
+        </div>
+        ${rows ? `<div class="buoy-popup__data">${rows}</div>` : '<div class="buoy-popup__no-data">No data available</div>'}
+        ${rawSection}
+        <div class="buoy-popup__time">${formatMetarTime(obsTime)}</div>
+      </div>
+    `;
+
+    // Remove existing popup
+    buoyPopup?.remove();
+
+    buoyPopup = new maplibregl.Popup({
+      closeButton: true,
+      closeOnClick: true,
+      maxWidth: '320px',
+      className: 'buoy-popup-container',
+    })
+      .setLngLat(coords)
+      .setHTML(html)
+      .addTo(map);
+  }
+
+  /**
+   * Remove buoy layers and source from the map
+   */
+  function removeBuoyLayers() {
+    if (!map) return;
+
+    // Remove event listeners
+    map.off('click', BUOY_CIRCLE_LAYER_ID, handleBuoyClick);
+
+    // Remove layers
+    if (map.getLayer(BUOY_LABEL_LAYER_ID)) {
+      try { map.removeLayer(BUOY_LABEL_LAYER_ID); } catch (e) {}
+    }
+    if (map.getLayer(BUOY_CIRCLE_LAYER_ID)) {
+      try { map.removeLayer(BUOY_CIRCLE_LAYER_ID); } catch (e) {}
+    }
+    if (map.getSource(BUOY_SOURCE_ID)) {
+      try { map.removeSource(BUOY_SOURCE_ID); } catch (e) {}
+    }
+
+    // Remove popup
+    buoyPopup?.remove();
+    buoyPopup = null;
+  }
+
+  /**
+   * Start the buoy auto-refresh timer
+   */
+  function startBuoyRefresh() {
+    stopBuoyRefresh();
+    buoyRefreshTimer = setInterval(() => {
+      if (buoyEnabled && !buoyLoading) {
+        console.log('[BUOY] Auto-refreshing...');
+        loadBuoyData();
+      }
+    }, BUOY_REFRESH_INTERVAL);
+  }
+
+  /**
+   * Stop the buoy auto-refresh timer
+   */
+  function stopBuoyRefresh() {
+    if (buoyRefreshTimer) {
+      clearInterval(buoyRefreshTimer);
+      buoyRefreshTimer = null;
+    }
+  }
+
+  /**
+   * Toggle NDBC buoy station overlay on/off
+   */
+  async function handleBuoyToggle() {
+    if (buoyEnabled) {
+      // Disable
+      buoyEnabled = false;
+      removeBuoyLayers();
+      stopBuoyRefresh();
+      buoyData = null;
+      console.log('[BUOY] Disabled');
+    } else {
+      // Enable
+      buoyEnabled = true;
+      await loadBuoyData();
+      startBuoyRefresh();
+      console.log('[BUOY] Enabled with auto-refresh');
+    }
+  }
+
+  // ==========================================================================
+  // TAF - Terminal Aerodrome Forecast Overlay
+  // ==========================================================================
+
+  /**
+   * Derive a "worst ceiling" flight-category-like color from the first TAF period.
+   * Uses the lowest BKN/OVC ceiling to pick a color:
+   *   >= 3000ft: green, >= 1000ft: blue, >= 500ft: red, < 500ft: magenta
+   * Falls back to grey if no ceilings.
+   */
+  function tafCeilingColor(periods: TafPeriod[]): string {
+    if (!periods || periods.length === 0) return '#888888';
+    // Use the first (current) period
+    const first = periods[0];
+    const ceilingLayers = first.cloud_layers?.filter(
+      (l: { cover: string; base_m: number }) => l.cover === 'BKN' || l.cover === 'OVC'
+    ) ?? [];
+    if (ceilingLayers.length === 0) return '#00cc44'; // No ceiling = clear = green
+    const lowestFt = Math.min(...ceilingLayers.map((l: { base_m: number }) => l.base_m * 3.28084));
+    if (lowestFt >= 3000) return '#00cc44';   // VFR-like
+    if (lowestFt >= 1000) return '#3388ff';   // MVFR-like
+    if (lowestFt >= 500) return '#dd2222';    // IFR-like
+    return '#cc00cc';                          // LIFR-like
+  }
+
+  /**
+   * Format a TAF period time range for the popup, e.g. "04Z-09Z"
+   */
+  function tafTimeRange(from: string, to: string): string {
+    const f = new Date(from);
+    const t = new Date(to);
+    const fh = String(f.getUTCHours()).padStart(2, '0');
+    const th = String(t.getUTCHours()).padStart(2, '0');
+    // Include day if they differ
+    const fd = f.getUTCDate();
+    const td = t.getUTCDate();
+    if (fd !== td) {
+      return `${fd}/${fh}Z–${td}/${th}Z`;
+    }
+    return `${fh}Z–${th}Z`;
+  }
+
+  /**
+   * Convert meters to feet, rounded
+   */
+  function metersToFeet(m: number): number {
+    return Math.round(m * 3.28084);
+  }
+
+  /**
+   * Build the label for the TAF map marker: wind speed in knots (from first period)
+   */
+  function tafLabel(periods: TafPeriod[]): string {
+    if (!periods || periods.length === 0) return '';
+    const first = periods[0];
+    if (first.wind_speed_ms != null) {
+      return `${msToKnots(first.wind_speed_ms)}kt`;
+    }
+    return '';
+  }
+
+  /**
+   * Load TAF data and update the map layer
+   */
+  async function loadTafData() {
+    if (!map) return;
+    tafLoading = true;
+
+    try {
+      const data = await fetchTafStations();
+
+      // Add display properties for the symbol layer
+      for (const feature of data.features) {
+        const p = feature.properties as unknown as Record<string, unknown>;
+        const periods = feature.properties.periods;
+        p.display_label = tafLabel(periods);
+        p.circle_color = tafCeilingColor(periods);
+      }
+
+      tafData = data;
+
+      // Update or create the source
+      const source = map.getSource(TAF_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(data as unknown as GeoJSON.FeatureCollection);
+      } else {
+        setupTafLayers(data);
+      }
+
+      console.log(`[TAF] Loaded ${data.features.length} stations`);
+    } catch (error) {
+      console.error('[TAF] Failed to load:', error);
+    } finally {
+      tafLoading = false;
+    }
+  }
+
+  /**
+   * Set up MapLibre source and layers for TAF stations
+   */
+  function setupTafLayers(data: TafFeatureCollection) {
+    if (!map) return;
+
+    map.addSource(TAF_SOURCE_ID, {
+      type: 'geojson',
+      data: data as unknown as GeoJSON.FeatureCollection,
+    });
+
+    // Circle layer: colored by ceiling-derived category (stored as property)
+    map.addLayer({
+      id: TAF_CIRCLE_LAYER_ID,
+      type: 'circle',
+      source: TAF_SOURCE_ID,
+      paint: {
+        'circle-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 4,
+          6, 6,
+          10, 8,
+        ],
+        'circle-color': ['coalesce', ['get', 'circle_color'], '#888888'],
+        'circle-stroke-width': 2,
+        'circle-stroke-color': 'rgba(255, 255, 255, 0.6)',
+        'circle-opacity': 0.85,
+      },
+    });
+
+    // Symbol layer: wind speed label
+    map.addLayer({
+      id: TAF_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: TAF_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'display_label'],
+        'text-size': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 8,
+          6, 10,
+          10, 12,
+        ],
+        'text-offset': [0, -1.4],
+        'text-anchor': 'bottom',
+        'text-allow-overlap': false,
+        'text-ignore-placement': false,
+        'text-optional': true,
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+      },
+      paint: {
+        'text-color': '#e8d5b7',
+        'text-halo-color': 'rgba(0, 0, 0, 0.8)',
+        'text-halo-width': 1.5,
+      },
+      minzoom: 4,
+    });
+
+    // Click handler
+    map.on('click', TAF_CIRCLE_LAYER_ID, handleTafClick);
+
+    map.on('mouseenter', TAF_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = 'pointer';
+    });
+    map.on('mouseleave', TAF_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = '';
+    });
+  }
+
+  /**
+   * Handle click on a TAF station circle to show the full forecast popup
+   */
+  function handleTafClick(e: maplibregl.MapLayerMouseEvent) {
+    if (!map || !e.features || e.features.length === 0) return;
+
+    const feature = e.features[0];
+    const coords = (feature.geometry as GeoJSON.Point).coordinates as [number, number];
+
+    // MapLibre flattens nested properties to JSON strings — we need to get
+    // the original feature from our stored data
+    const clickedId = feature.properties?.location_id as string;
+    const tafFeature = tafData?.features.find(
+      (f: { properties: { location_id: string } }) => f.properties.location_id === clickedId
+    );
+    if (!tafFeature) return;
+
+    const props = tafFeature.properties;
+    const stationId = props.location_id;
+    const name = props.name;
+    const issueTime = props.issue_time;
+    const validFrom = props.valid_from;
+    const validTo = props.valid_to;
+    const rawTaf = props.raw_taf;
+    const periods = props.periods ?? [];
+
+    // Build periods table
+    let periodsHtml = '';
+    for (const period of periods) {
+      const changeTag = period.change_type
+        ? `<span class="taf-popup__change-type">${period.change_type}</span> `
+        : '';
+      const timeStr = tafTimeRange(period.from, period.to);
+
+      let details = '';
+
+      // Wind
+      if (period.wind_speed_ms != null) {
+        let windStr = '';
+        if (period.wind_direction_deg != null) {
+          windStr = `${period.wind_direction_deg}° ${msToKnots(period.wind_speed_ms)}kt`;
+        } else {
+          windStr = `VRB ${msToKnots(period.wind_speed_ms)}kt`;
+        }
+        if (period.wind_gust_ms != null && period.wind_gust_ms > 0) {
+          windStr += `G${msToKnots(period.wind_gust_ms)}`;
+        }
+        details += `<span class="taf-popup__detail">${windStr}</span>`;
+      }
+
+      // Visibility
+      if (period.visibility_m != null) {
+        details += `<span class="taf-popup__detail">${metersToSM(period.visibility_m)}</span>`;
+      }
+
+      // Weather
+      if (period.wx_string) {
+        details += `<span class="taf-popup__wx">${period.wx_string}</span>`;
+      }
+
+      // Clouds
+      if (period.cloud_layers && period.cloud_layers.length > 0) {
+        const clouds = period.cloud_layers
+          .map((l: { cover: string; base_m: number }) => `${l.cover} ${Math.round(metersToFeet(l.base_m) / 100).toString().padStart(3, '0')}`)
+          .join(' ');
+        details += `<span class="taf-popup__detail taf-popup__clouds">${clouds}</span>`;
+      }
+
+      periodsHtml += `
+        <div class="taf-popup__period">
+          <div class="taf-popup__period-header">${changeTag}<span class="taf-popup__period-time">${timeStr}</span></div>
+          <div class="taf-popup__period-details">${details}</div>
+        </div>
+      `;
+    }
+
+    const html = `
+      <div class="taf-popup">
+        <div class="taf-popup__header">
+          <strong>${stationId}</strong> <span class="taf-popup__name">${name}</span>
+        </div>
+        <div class="taf-popup__validity">Valid ${formatMetarTime(validFrom)} — ${formatMetarTime(validTo)}</div>
+        <div class="taf-popup__periods">${periodsHtml}</div>
+        <div class="taf-popup__raw">${rawTaf}</div>
+        <div class="taf-popup__time">Issued ${formatMetarTime(issueTime)}</div>
+      </div>
+    `;
+
+    tafPopup?.remove();
+
+    tafPopup = new maplibregl.Popup({
+      closeButton: true,
+      closeOnClick: true,
+      maxWidth: '400px',
+      className: 'taf-popup-container',
+    })
+      .setLngLat(coords)
+      .setHTML(html)
+      .addTo(map);
+  }
+
+  /**
+   * Remove TAF layers and source from the map
+   */
+  function removeTafLayers() {
+    if (!map) return;
+    map.off('click', TAF_CIRCLE_LAYER_ID, handleTafClick);
+    if (map.getLayer(TAF_LABEL_LAYER_ID)) {
+      try { map.removeLayer(TAF_LABEL_LAYER_ID); } catch (e) {}
+    }
+    if (map.getLayer(TAF_CIRCLE_LAYER_ID)) {
+      try { map.removeLayer(TAF_CIRCLE_LAYER_ID); } catch (e) {}
+    }
+    if (map.getSource(TAF_SOURCE_ID)) {
+      try { map.removeSource(TAF_SOURCE_ID); } catch (e) {}
+    }
+    tafPopup?.remove();
+    tafPopup = null;
+  }
+
+  function startTafRefresh() {
+    stopTafRefresh();
+    tafRefreshTimer = setInterval(() => {
+      if (tafEnabled && !tafLoading) {
+        console.log('[TAF] Auto-refreshing...');
+        loadTafData();
+      }
+    }, TAF_REFRESH_INTERVAL);
+  }
+
+  function stopTafRefresh() {
+    if (tafRefreshTimer) {
+      clearInterval(tafRefreshTimer);
+      tafRefreshTimer = null;
+    }
+  }
+
+  async function handleTafToggle() {
+    if (tafEnabled) {
+      tafEnabled = false;
+      removeTafLayers();
+      stopTafRefresh();
+      tafData = null;
+      console.log('[TAF] Disabled');
+    } else {
+      tafEnabled = true;
+      await loadTafData();
+      startTafRefresh();
+      console.log('[TAF] Enabled with auto-refresh');
+    }
+  }
+
+  // ==========================================================================
+  // DART - Deep-ocean Assessment and Reporting of Tsunamis
+  // ==========================================================================
+
+  /**
+   * Build an inline SVG chart string from DART observations.
+   * Renders a time series of water_column_height_m with series colored by measurement type.
+   */
+  function buildDartChartSvg(
+    obs: DartObservation[],
+    stationId: string,
+    width: number = 360,
+    height: number = 180,
+  ): string {
+    if (obs.length === 0) {
+      return `<div style="color:rgba(255,255,255,0.5);text-align:center;padding:20px;">No data available</div>`;
+    }
+
+    // Chart area padding
+    const padLeft = 62;
+    const padRight = 12;
+    const padTop = 10;
+    const padBottom = 42;
+    const plotW = width - padLeft - padRight;
+    const plotH = height - padTop - padBottom;
+
+    // Data extent
+    const times = obs.map((o) => new Date(o.obs_time).getTime());
+    const heights = obs.map((o) => o.water_column_height_m);
+    const tMin = Math.min(...times);
+    const tMax = Math.max(...times);
+    const hMin = Math.min(...heights);
+    const hMax = Math.max(...heights);
+
+    // Add small padding to Y range so lines don't touch edges
+    const hRange = hMax - hMin || 1;
+    const yPad = hRange * 0.08;
+    const yMin = hMin - yPad;
+    const yMax = hMax + yPad;
+    const tRange = tMax - tMin || 1;
+
+    // Scale functions
+    const scaleX = (t: number) => padLeft + ((t - tMin) / tRange) * plotW;
+    const scaleY = (h: number) => padTop + plotH - ((h - yMin) / (yMax - yMin)) * plotH;
+
+    // Build gridlines and Y-axis labels
+    const yTickCount = 5;
+    const yStep = (yMax - yMin) / yTickCount;
+    let gridLines = '';
+    for (let i = 0; i <= yTickCount; i++) {
+      const val = yMin + i * yStep;
+      const y = scaleY(val);
+      // Format: use comma separator for thousands, show 1 decimal
+      const label = val.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+      gridLines += `<line x1="${padLeft}" y1="${y}" x2="${width - padRight}" y2="${y}" stroke="rgba(255,255,255,0.1)" stroke-width="0.5"/>`;
+      gridLines += `<text x="${padLeft - 4}" y="${y + 3}" text-anchor="end" fill="rgba(255,255,255,0.5)" font-size="9" font-family="sans-serif">${label}</text>`;
+    }
+
+    // X-axis labels — ~daily ticks
+    const dayMs = 24 * 60 * 60 * 1000;
+    const firstDay = new Date(tMin);
+    firstDay.setUTCHours(0, 0, 0, 0);
+    let xTick = firstDay.getTime() + dayMs; // Start at next midnight
+    let xLabels = '';
+    while (xTick < tMax) {
+      const x = scaleX(xTick);
+      if (x > padLeft + 20 && x < width - padRight - 20) {
+        const d = new Date(xTick);
+        const label = `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+        xLabels += `<line x1="${x}" y1="${padTop}" x2="${x}" y2="${padTop + plotH}" stroke="rgba(255,255,255,0.08)" stroke-width="0.5"/>`;
+        xLabels += `<text x="${x}" y="${height - padBottom + 14}" text-anchor="middle" fill="rgba(255,255,255,0.5)" font-size="9" font-family="sans-serif">${label}</text>`;
+      }
+      xTick += dayMs;
+    }
+
+    // Group observations by measurement type
+    const groups = new Map<number, DartObservation[]>();
+    for (const o of obs) {
+      const arr = groups.get(o.measurement_type) ?? [];
+      arr.push(o);
+      groups.set(o.measurement_type, arr);
+    }
+
+    // Series styles: T=1 solid blue, T=2 dotted green, T=3 dashed red
+    const seriesStyle: Record<number, { color: string; dash: string; label: string }> = {
+      1: { color: '#4a9eda', dash: '', label: '15-min' },
+      2: { color: '#27ae60', dash: '3,2', label: '1-min' },
+      3: { color: '#e74c3c', dash: '6,3', label: '15-sec' },
+    };
+
+    // Build polylines for each measurement type
+    let polylines = '';
+    for (const [mType, observations] of groups) {
+      const style = seriesStyle[mType] ?? seriesStyle[1];
+      const points = observations
+        .map((o) => `${scaleX(new Date(o.obs_time).getTime()).toFixed(1)},${scaleY(o.water_column_height_m).toFixed(1)}`)
+        .join(' ');
+      const dashAttr = style.dash ? ` stroke-dasharray="${style.dash}"` : '';
+      polylines += `<polyline points="${points}" fill="none" stroke="${style.color}" stroke-width="1.5"${dashAttr} stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
+
+    // Build legend
+    const activeTypes = Array.from(groups.keys()).sort();
+    let legendX = padLeft;
+    let legendItems = '';
+    for (const mType of activeTypes) {
+      const style = seriesStyle[mType] ?? seriesStyle[1];
+      const dashAttr = style.dash ? ` stroke-dasharray="${style.dash}"` : '';
+      legendItems += `<line x1="${legendX}" y1="${height - 8}" x2="${legendX + 18}" y2="${height - 8}" stroke="${style.color}" stroke-width="2"${dashAttr}/>`;
+      legendItems += `<text x="${legendX + 22}" y="${height - 4}" fill="rgba(255,255,255,0.6)" font-size="8" font-family="sans-serif">${style.label}</text>`;
+      legendX += 60;
+    }
+
+    // "GMT" label on x-axis
+    const gmtLabel = `<text x="${padLeft + plotW / 2}" y="${height - padBottom + 28}" text-anchor="middle" fill="rgba(255,255,255,0.4)" font-size="9" font-family="sans-serif">GMT</text>`;
+
+    // Y-axis title
+    const yTitle = `<text x="12" y="${padTop + plotH / 2}" text-anchor="middle" fill="rgba(255,255,255,0.4)" font-size="9" font-family="sans-serif" transform="rotate(-90, 12, ${padTop + plotH / 2})">Height (m)</text>`;
+
+    // Plot border
+    const border = `<rect x="${padLeft}" y="${padTop}" width="${plotW}" height="${plotH}" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="0.5"/>`;
+
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="display:block;">
+      ${gridLines}
+      ${xLabels}
+      ${border}
+      ${polylines}
+      ${gmtLabel}
+      ${yTitle}
+      ${legendItems}
+    </svg>`;
+  }
+
+  /**
+   * Load DART station locations and set up map layers
+   */
+  async function loadDartData() {
+    if (!map) return;
+    dartLoading = true;
+
+    try {
+      const data = await fetchDartLocations();
+
+      const source = map.getSource(DART_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (source) {
+        source.setData(data as unknown as GeoJSON.FeatureCollection);
+      } else {
+        setupDartLayers(data);
+      }
+
+      console.log(`[DART] Loaded ${data.features.length} stations`);
+    } catch (error) {
+      console.error('[DART] Failed to load:', error);
+    } finally {
+      dartLoading = false;
+    }
+  }
+
+  /**
+   * Set up MapLibre source and layers for DART stations
+   */
+  function setupDartLayers(data: DartLocationCollection) {
+    if (!map) return;
+
+    map.addSource(DART_SOURCE_ID, {
+      type: 'geojson',
+      data: data as unknown as GeoJSON.FeatureCollection,
+    });
+
+    // Circle layer: deep ocean blue
+    map.addLayer({
+      id: DART_CIRCLE_LAYER_ID,
+      type: 'circle',
+      source: DART_SOURCE_ID,
+      paint: {
+        'circle-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          2, 4,
+          5, 6,
+          10, 8,
+        ],
+        'circle-color': '#1a5276',
+        'circle-stroke-width': 2,
+        'circle-stroke-color': '#4a9eda',
+        'circle-opacity': 0.9,
+      },
+    });
+
+    // Symbol layer: station ID label
+    map.addLayer({
+      id: DART_LABEL_LAYER_ID,
+      type: 'symbol',
+      source: DART_SOURCE_ID,
+      layout: {
+        'text-field': ['get', 'location_id'],
+        'text-size': [
+          'interpolate', ['linear'], ['zoom'],
+          3, 8,
+          6, 10,
+          10, 12,
+        ],
+        'text-offset': [0, -1.4],
+        'text-anchor': 'bottom',
+        'text-allow-overlap': false,
+        'text-ignore-placement': false,
+        'text-optional': true,
+        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+      },
+      paint: {
+        'text-color': '#85c1e9',
+        'text-halo-color': 'rgba(0, 0, 0, 0.8)',
+        'text-halo-width': 1.5,
+      },
+      minzoom: 5,
+    });
+
+    // Click handler
+    map.on('click', DART_CIRCLE_LAYER_ID, handleDartClick);
+
+    map.on('mouseenter', DART_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = 'pointer';
+    });
+    map.on('mouseleave', DART_CIRCLE_LAYER_ID, () => {
+      if (map) map.getCanvas().style.cursor = '';
+    });
+  }
+
+  /**
+   * Handle click on a DART station: show popup with loading state, then fetch time series and render chart
+   */
+  async function handleDartClick(e: maplibregl.MapLayerMouseEvent) {
+    if (!map || !e.features || e.features.length === 0) return;
+
+    const feature = e.features[0];
+    const props = feature.properties as Record<string, unknown>;
+    const coords = (feature.geometry as GeoJSON.Point).coordinates as [number, number];
+
+    const stationId = props.location_id as string;
+    const name = props.name as string;
+
+    // Show popup immediately with loading state
+    dartPopup?.remove();
+
+    const loadingHtml = `
+      <div class="dart-popup">
+        <div class="dart-popup__header">
+          <strong>Station ${stationId}</strong> <span class="dart-popup__name">${name || ''}</span>
+        </div>
+        <div class="dart-popup__chart-container">
+          <div class="dart-popup__loading">
+            <span class="dart-popup__spinner"></span>
+            Loading water column data...
+          </div>
+        </div>
+      </div>
+    `;
+
+    dartPopup = new maplibregl.Popup({
+      closeButton: true,
+      closeOnClick: true,
+      maxWidth: '420px',
+      className: 'dart-popup-container',
+    })
+      .setLngLat(coords)
+      .setHTML(loadingHtml)
+      .addTo(map);
+
+    // Fetch time series data asynchronously
+    try {
+      const observations = await fetchDartTimeSeries(stationId, 5, 500);
+
+      // Check popup is still open (user may have closed it)
+      if (!dartPopup || !dartPopup.isOpen()) return;
+
+      const chartSvg = buildDartChartSvg(observations, stationId);
+
+      // Latest observation info
+      let latestInfo = '';
+      if (observations.length > 0) {
+        const latest = observations[observations.length - 1];
+        latestInfo = `
+          <div class="dart-popup__latest">
+            <span class="dart-popup__latest-label">Latest:</span>
+            <span>${latest.water_column_height_m.toFixed(3)} m</span>
+            <span class="dart-popup__latest-time">${formatMetarTime(latest.obs_time)}</span>
+          </div>
+        `;
+      }
+
+      const chartHtml = `
+        <div class="dart-popup">
+          <div class="dart-popup__header">
+            <strong>Station ${stationId}</strong> <span class="dart-popup__name">${name || ''}</span>
+          </div>
+          <div class="dart-popup__subtitle">Water Column Height</div>
+          ${latestInfo}
+          <div class="dart-popup__chart-container">
+            ${chartSvg}
+          </div>
+          <div class="dart-popup__footer">${observations.length} observations over 5 days</div>
+        </div>
+      `;
+
+      // Replace popup content
+      const popupEl = dartPopup.getElement();
+      if (popupEl) {
+        const contentEl = popupEl.querySelector('.maplibregl-popup-content');
+        if (contentEl) {
+          contentEl.innerHTML = chartHtml + '<button class="maplibregl-popup-close-button" type="button" aria-label="Close popup">x</button>';
+          // Re-attach close handler
+          const closeBtn = contentEl.querySelector('.maplibregl-popup-close-button');
+          if (closeBtn) {
+            closeBtn.addEventListener('click', () => dartPopup?.remove());
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[DART] Failed to load time series:', error);
+      // Update popup with error message
+      const popupEl = dartPopup?.getElement();
+      if (popupEl) {
+        const container = popupEl.querySelector('.dart-popup__chart-container');
+        if (container) {
+          container.innerHTML = '<div style="color:#e74c3c;text-align:center;padding:16px;">Failed to load data</div>';
+        }
+      }
+    }
+  }
+
+  /**
+   * Remove DART layers and source from the map
+   */
+  function removeDartLayers() {
+    if (!map) return;
+    map.off('click', DART_CIRCLE_LAYER_ID, handleDartClick);
+    if (map.getLayer(DART_LABEL_LAYER_ID)) {
+      try { map.removeLayer(DART_LABEL_LAYER_ID); } catch (e) {}
+    }
+    if (map.getLayer(DART_CIRCLE_LAYER_ID)) {
+      try { map.removeLayer(DART_CIRCLE_LAYER_ID); } catch (e) {}
+    }
+    if (map.getSource(DART_SOURCE_ID)) {
+      try { map.removeSource(DART_SOURCE_ID); } catch (e) {}
+    }
+    dartPopup?.remove();
+    dartPopup = null;
+  }
+
+  function startDartRefresh() {
+    stopDartRefresh();
+    dartRefreshTimer = setInterval(() => {
+      if (dartEnabled && !dartLoading) {
+        console.log('[DART] Auto-refreshing locations...');
+        loadDartData();
+      }
+    }, DART_REFRESH_INTERVAL);
+  }
+
+  function stopDartRefresh() {
+    if (dartRefreshTimer) {
+      clearInterval(dartRefreshTimer);
+      dartRefreshTimer = null;
+    }
+  }
+
+  async function handleDartToggle() {
+    if (dartEnabled) {
+      dartEnabled = false;
+      removeDartLayers();
+      stopDartRefresh();
+      console.log('[DART] Disabled');
+    } else {
+      dartEnabled = true;
+      await loadDartData();
+      startDartRefresh();
+      console.log('[DART] Enabled with auto-refresh');
     }
   }
 
@@ -4260,6 +5319,63 @@
     </button>
 
     <button
+      class="map-view__buoy-toggle"
+      class:map-view__buoy-toggle--active={buoyEnabled}
+      onclick={handleBuoyToggle}
+      disabled={buoyLoading}
+      title={buoyEnabled ? "Hide buoys" : "Show buoys"}
+    >
+      {#if buoyLoading}
+        <span class="map-view__wind-spinner"></span>
+      {:else}
+        <svg class="map-view__buoy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="8" r="3"/>
+          <path d="M12 11v6m-4 0h8" stroke-linecap="round"/>
+          <path d="M5 21c2-2 4-2 7-2s5 0 7 2" stroke-linecap="round"/>
+        </svg>
+      {/if}
+      <span>Buoys <kbd>B</kbd></span>
+    </button>
+
+    <button
+      class="map-view__taf-toggle"
+      class:map-view__taf-toggle--active={tafEnabled}
+      onclick={handleTafToggle}
+      disabled={tafLoading}
+      title={tafEnabled ? "Hide TAFs" : "Show TAFs"}
+    >
+      {#if tafLoading}
+        <span class="map-view__wind-spinner"></span>
+      {:else}
+        <svg class="map-view__taf-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="4" width="18" height="16" rx="2"/>
+          <path d="M3 10h18M9 4v16" stroke-linecap="round"/>
+        </svg>
+      {/if}
+      <span>TAFs <kbd>T</kbd></span>
+    </button>
+
+    <button
+      class="map-view__dart-toggle"
+      class:map-view__dart-toggle--active={dartEnabled}
+      onclick={handleDartToggle}
+      disabled={dartLoading}
+      title={dartEnabled ? "Hide DART buoys" : "Show DART buoys"}
+    >
+      {#if dartLoading}
+        <span class="map-view__wind-spinner"></span>
+      {:else}
+        <svg class="map-view__dart-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M2 18c3-3 6-3 9 0s6 3 9 0" stroke-linecap="round"/>
+          <path d="M2 14c3-3 6-3 9 0s6 3 9 0" stroke-linecap="round" opacity="0.5"/>
+          <circle cx="12" cy="8" r="2.5" fill="currentColor" stroke="none"/>
+          <line x1="12" y1="10.5" x2="12" y2="14" stroke-linecap="round"/>
+        </svg>
+      {/if}
+      <span>DART <kbd>G</kbd></span>
+    </button>
+
+    <button
       class="map-view__lock-toggle"
       class:map-view__lock-toggle--locked={mapLocked}
       onclick={() => mapLocked = !mapLocked}
@@ -4672,6 +5788,18 @@
               <tr>
                 <td><kbd>O</kbd></td>
                 <td>Toggle METAR station overlay</td>
+              </tr>
+              <tr>
+                <td><kbd>B</kbd></td>
+                <td>Toggle NDBC buoy station overlay</td>
+              </tr>
+              <tr>
+                <td><kbd>T</kbd></td>
+                <td>Toggle TAF forecast overlay</td>
+              </tr>
+              <tr>
+                <td><kbd>G</kbd></td>
+                <td>Toggle DART tsunami buoy overlay</td>
               </tr>
               <tr>
                 <td><kbd>R</kbd></td>
@@ -5430,6 +6558,138 @@
   }
 
   .map-view__metar-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .map-view__buoy-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(4px);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .map-view__buoy-toggle kbd {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    opacity: 0.7;
+  }
+
+  .map-view__buoy-toggle:hover:not(:disabled) {
+    border-color: #00bcd4;
+    color: white;
+  }
+
+  .map-view__buoy-toggle:disabled {
+    cursor: wait;
+    opacity: 0.7;
+  }
+
+  .map-view__buoy-toggle--active {
+    background: rgba(0, 188, 212, 0.3);
+    border-color: #00bcd4;
+    color: white;
+  }
+
+  .map-view__buoy-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .map-view__taf-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(4px);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .map-view__taf-toggle kbd {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    opacity: 0.7;
+  }
+
+  .map-view__taf-toggle:hover:not(:disabled) {
+    border-color: #d4a04c;
+    color: white;
+  }
+
+  .map-view__taf-toggle:disabled {
+    cursor: wait;
+    opacity: 0.7;
+  }
+
+  .map-view__taf-toggle--active {
+    background: rgba(212, 160, 76, 0.3);
+    border-color: #d4a04c;
+    color: white;
+  }
+
+  .map-view__taf-icon {
+    width: 16px;
+    height: 16px;
+  }
+
+  .map-view__dart-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: rgba(30, 30, 30, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(4px);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .map-view__dart-toggle kbd {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    opacity: 0.7;
+  }
+
+  .map-view__dart-toggle:hover:not(:disabled) {
+    border-color: #4a9eda;
+    color: white;
+  }
+
+  .map-view__dart-toggle:disabled {
+    cursor: wait;
+    opacity: 0.7;
+  }
+
+  .map-view__dart-toggle--active {
+    background: rgba(26, 82, 118, 0.4);
+    border-color: #4a9eda;
+    color: white;
+  }
+
+  .map-view__dart-icon {
     width: 16px;
     height: 16px;
   }
@@ -6323,6 +7583,347 @@
   :global(.metar-popup__time) {
     font-size: 11px;
     color: rgba(255, 255, 255, 0.4);
+    text-align: right;
+  }
+
+  /* NDBC Buoy popup styles (global because MapLibre popups are outside component scope) */
+  :global(.buoy-popup-container .maplibregl-popup-content) {
+    background: rgba(10, 25, 35, 0.95);
+    border: 1px solid rgba(0, 188, 212, 0.3);
+    border-radius: 8px;
+    padding: 0;
+    color: white;
+    font-size: 13px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+
+  :global(.buoy-popup-container .maplibregl-popup-close-button) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 18px;
+    padding: 4px 8px;
+  }
+
+  :global(.buoy-popup-container .maplibregl-popup-close-button:hover) {
+    color: white;
+    background: transparent;
+  }
+
+  :global(.buoy-popup-container .maplibregl-popup-tip) {
+    border-top-color: rgba(10, 25, 35, 0.95);
+  }
+
+  :global(.buoy-popup) {
+    padding: 10px 12px;
+    min-width: 220px;
+  }
+
+  :global(.buoy-popup__header) {
+    font-size: 14px;
+    margin-bottom: 8px;
+    padding-right: 16px;
+  }
+
+  :global(.buoy-popup__header strong) {
+    font-size: 15px;
+    color: #00bcd4;
+  }
+
+  :global(.buoy-popup__name) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
+  :global(.buoy-popup__data) {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 8px;
+  }
+
+  :global(.buoy-popup__row) {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  :global(.buoy-popup__label) {
+    color: rgba(255, 255, 255, 0.5);
+    flex-shrink: 0;
+  }
+
+  :global(.buoy-popup__no-data) {
+    color: rgba(255, 255, 255, 0.4);
+    font-style: italic;
+    margin-bottom: 8px;
+  }
+
+  :global(.buoy-popup__raw) {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    background: rgba(0, 0, 0, 0.3);
+    padding: 6px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    line-height: 1.4;
+    margin-bottom: 6px;
+  }
+
+  :global(.buoy-popup__time) {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: right;
+  }
+
+  /* TAF popup styles (global because MapLibre popups are outside component scope) */
+  :global(.taf-popup-container .maplibregl-popup-content) {
+    background: rgba(25, 20, 10, 0.95);
+    border: 1px solid rgba(212, 160, 76, 0.3);
+    border-radius: 8px;
+    padding: 0;
+    color: white;
+    font-size: 13px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    max-height: 420px;
+    overflow-y: auto;
+  }
+
+  :global(.taf-popup-container .maplibregl-popup-close-button) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 18px;
+    padding: 4px 8px;
+  }
+
+  :global(.taf-popup-container .maplibregl-popup-close-button:hover) {
+    color: white;
+    background: transparent;
+  }
+
+  :global(.taf-popup-container .maplibregl-popup-tip) {
+    border-top-color: rgba(25, 20, 10, 0.95);
+  }
+
+  :global(.taf-popup) {
+    padding: 10px 12px;
+    min-width: 280px;
+  }
+
+  :global(.taf-popup__header) {
+    font-size: 14px;
+    margin-bottom: 4px;
+    padding-right: 16px;
+  }
+
+  :global(.taf-popup__header strong) {
+    font-size: 15px;
+    color: #d4a04c;
+  }
+
+  :global(.taf-popup__name) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
+  :global(.taf-popup__validity) {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+    margin-bottom: 8px;
+  }
+
+  :global(.taf-popup__periods) {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  :global(.taf-popup__period) {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    padding: 5px 7px;
+    border-left: 3px solid rgba(212, 160, 76, 0.4);
+  }
+
+  :global(.taf-popup__period-header) {
+    font-size: 12px;
+    margin-bottom: 3px;
+  }
+
+  :global(.taf-popup__change-type) {
+    display: inline-block;
+    background: rgba(212, 160, 76, 0.3);
+    color: #e8d5b7;
+    padding: 0 4px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-right: 4px;
+  }
+
+  :global(.taf-popup__period-time) {
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 11px;
+  }
+
+  :global(.taf-popup__period-details) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  :global(.taf-popup__detail) {
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  :global(.taf-popup__wx) {
+    color: #ff9966;
+    font-weight: 600;
+  }
+
+  :global(.taf-popup__clouds) {
+    color: rgba(180, 200, 255, 0.8);
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+  }
+
+  :global(.taf-popup__raw) {
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    background: rgba(0, 0, 0, 0.3);
+    padding: 6px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    line-height: 1.4;
+    margin-bottom: 6px;
+  }
+
+  :global(.taf-popup__time) {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: right;
+  }
+
+  /* DART popup styles (global because MapLibre popups are outside component scope) */
+  :global(.dart-popup-container .maplibregl-popup-content) {
+    background: rgba(10, 15, 30, 0.95);
+    border: 1px solid rgba(74, 158, 218, 0.3);
+    border-radius: 8px;
+    padding: 0;
+    color: white;
+    font-size: 13px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  }
+
+  :global(.dart-popup-container .maplibregl-popup-close-button) {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 18px;
+    padding: 4px 8px;
+    z-index: 10;
+  }
+
+  :global(.dart-popup-container .maplibregl-popup-close-button:hover) {
+    color: white;
+    background: transparent;
+  }
+
+  :global(.dart-popup-container .maplibregl-popup-tip) {
+    border-top-color: rgba(10, 15, 30, 0.95);
+  }
+
+  :global(.dart-popup) {
+    padding: 10px 12px;
+    min-width: 360px;
+  }
+
+  :global(.dart-popup__header) {
+    font-size: 14px;
+    margin-bottom: 2px;
+    padding-right: 20px;
+  }
+
+  :global(.dart-popup__header strong) {
+    font-size: 15px;
+    color: #4a9eda;
+  }
+
+  :global(.dart-popup__name) {
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 11px;
+    margin-left: 4px;
+  }
+
+  :global(.dart-popup__subtitle) {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.6);
+    margin-bottom: 6px;
+  }
+
+  :global(.dart-popup__latest) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    margin-bottom: 8px;
+    padding: 4px 8px;
+    background: rgba(74, 158, 218, 0.1);
+    border-radius: 4px;
+  }
+
+  :global(.dart-popup__latest-label) {
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 11px;
+  }
+
+  :global(.dart-popup__latest-time) {
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 11px;
+    margin-left: auto;
+  }
+
+  :global(.dart-popup__chart-container) {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+    padding: 4px;
+    margin-bottom: 6px;
+    min-height: 100px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  :global(.dart-popup__loading) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 12px;
+    padding: 30px 0;
+  }
+
+  :global(.dart-popup__spinner) {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(74, 158, 218, 0.3);
+    border-top-color: #4a9eda;
+    border-radius: 50%;
+    animation: dart-spin 0.8s linear infinite;
+  }
+
+  @keyframes dart-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  :global(.dart-popup__footer) {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.3);
     text-align: right;
   }
 </style>

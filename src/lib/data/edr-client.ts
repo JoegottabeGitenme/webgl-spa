@@ -4225,3 +4225,372 @@ export async function fetchMetarStations(): Promise<MetarFeatureCollection> {
     return { type: 'FeatureCollection', features: [] };
   }
 }
+
+// =============================================================================
+// NDBC Buoy Station Observations
+// =============================================================================
+
+/**
+ * Properties for a single NDBC buoy/C-MAN observation from the EDR API.
+ * All fields except location_id and obs_time are optional — stations report
+ * different subsets of data depending on equipment and type.
+ */
+export interface BuoyProperties {
+  location_id: string;
+  name: string;
+  obs_time: string;
+  temperature_k?: number;
+  dewpoint_k?: number;
+  wind_direction_deg?: number;
+  wind_speed_ms?: number;
+  wind_gust_ms?: number;
+  sea_level_pressure_pa?: number;
+  water_temp_k?: number;
+  wave_height_m?: number;
+  dominant_wave_period_s?: number;
+  average_wave_period_s?: number;
+  mean_wave_direction_deg?: number;
+  visibility_m?: number;
+  raw_text?: string;
+}
+
+/**
+ * GeoJSON Feature with NDBC buoy properties
+ */
+export interface BuoyFeature {
+  type: 'Feature';
+  id: string;
+  geometry: {
+    type: 'Point';
+    coordinates: [number, number]; // [lng, lat]
+  };
+  properties: BuoyProperties;
+}
+
+/**
+ * GeoJSON FeatureCollection of NDBC buoy observations
+ */
+export interface BuoyFeatureCollection {
+  type: 'FeatureCollection';
+  features: BuoyFeature[];
+}
+
+/**
+ * Fetch latest NDBC buoy/C-MAN observations for all stations.
+ * Uses a radius query centered on CONUS with a large radius to capture
+ * offshore buoys and coastal stations. Deduplicates by location_id.
+ */
+export async function fetchBuoyStations(): Promise<BuoyFeatureCollection> {
+  const baseUrl = getEdrBaseUrl();
+  // Center on CONUS with 5000km radius — covers Atlantic, Pacific, Gulf, Great Lakes
+  const url = `${baseUrl}/edr/collections/ndbc/radius?coords=POINT(-98.0 39.0)&within=5000&within-units=km&limit=1`;
+
+  console.log('[fetchBuoyStations] Fetching:', url);
+
+  try {
+    const response = await authFetch(url);
+    if (!response.ok) {
+      console.error(`NDBC fetch failed: ${response.status} ${response.statusText}`);
+      return { type: 'FeatureCollection', features: [] };
+    }
+
+    const data = await response.json() as BuoyFeatureCollection;
+
+    // Deduplicate: keep only the latest observation per station
+    const latestByStation = new Map<string, BuoyFeature>();
+    for (const feature of data.features) {
+      const stationId = feature.properties.location_id;
+      const existing = latestByStation.get(stationId);
+      if (!existing || feature.properties.obs_time > existing.properties.obs_time) {
+        latestByStation.set(stationId, feature);
+      }
+    }
+
+    const deduped: BuoyFeatureCollection = {
+      type: 'FeatureCollection',
+      features: Array.from(latestByStation.values()),
+    };
+
+    console.log(`[fetchBuoyStations] Got ${deduped.features.length} stations (deduped from ${data.features.length} obs)`);
+    return deduped;
+  } catch (error) {
+    console.error('Error fetching NDBC buoy stations:', error);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+// =============================================================================
+// TAF - Terminal Aerodrome Forecasts
+// =============================================================================
+
+/**
+ * A single cloud layer within a TAF period
+ */
+export interface TafCloudLayer {
+  cover: 'FEW' | 'SCT' | 'BKN' | 'OVC' | string;
+  base_m: number;
+}
+
+/**
+ * A single forecast period within a TAF
+ */
+export interface TafPeriod {
+  from: string;
+  to: string;
+  change_type?: string; // FM, TEMPO, PROB, BECMG, etc.
+  wind_direction_deg?: number;
+  wind_speed_ms?: number;
+  wind_gust_ms?: number;
+  visibility_m?: number;
+  wx_string?: string;
+  cloud_layers: TafCloudLayer[];
+}
+
+/**
+ * Properties for a single TAF from the EDR API
+ */
+export interface TafProperties {
+  location_id: string;
+  name: string;
+  issue_time: string;
+  valid_from: string;
+  valid_to: string;
+  raw_taf: string;
+  periods: TafPeriod[];
+}
+
+/**
+ * GeoJSON Feature with TAF properties
+ */
+export interface TafFeature {
+  type: 'Feature';
+  id: string;
+  geometry: {
+    type: 'Point';
+    coordinates: [number, number]; // [lng, lat]
+  };
+  properties: TafProperties;
+}
+
+/**
+ * GeoJSON FeatureCollection of TAF forecasts
+ */
+export interface TafFeatureCollection {
+  type: 'FeatureCollection';
+  features: TafFeature[];
+}
+
+/**
+ * Fetch latest TAF forecasts for all stations.
+ * Uses a radius query centered on CONUS with a large radius.
+ * Deduplicates by location_id, keeping only the most recently issued TAF.
+ */
+export async function fetchTafStations(): Promise<TafFeatureCollection> {
+  const baseUrl = getEdrBaseUrl();
+  const url = `${baseUrl}/edr/collections/taf/radius?coords=POINT(-98.0 39.0)&within=5000&within-units=km&limit=1`;
+
+  console.log('[fetchTafStations] Fetching:', url);
+
+  try {
+    const response = await authFetch(url);
+    if (!response.ok) {
+      console.error(`TAF fetch failed: ${response.status} ${response.statusText}`);
+      return { type: 'FeatureCollection', features: [] };
+    }
+
+    const data = await response.json() as TafFeatureCollection;
+
+    // Deduplicate: keep only the latest issued TAF per station
+    const latestByStation = new Map<string, TafFeature>();
+    for (const feature of data.features) {
+      const stationId = feature.properties.location_id;
+      const existing = latestByStation.get(stationId);
+      if (!existing || feature.properties.issue_time > existing.properties.issue_time) {
+        latestByStation.set(stationId, feature);
+      }
+    }
+
+    const deduped: TafFeatureCollection = {
+      type: 'FeatureCollection',
+      features: Array.from(latestByStation.values()),
+    };
+
+    console.log(`[fetchTafStations] Got ${deduped.features.length} stations (deduped from ${data.features.length} TAFs)`);
+    return deduped;
+  } catch (error) {
+    console.error('Error fetching TAF stations:', error);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+// =============================================================================
+// DART - Deep-ocean Assessment and Reporting of Tsunamis
+// =============================================================================
+
+/**
+ * Properties for a DART station location (from /locations endpoint)
+ */
+export interface DartLocationProperties {
+  location_id: string;
+  name: string;
+  type: string;
+}
+
+/**
+ * GeoJSON Feature for a DART station location
+ */
+export interface DartLocationFeature {
+  type: 'Feature';
+  id: string;
+  geometry: {
+    type: 'Point';
+    coordinates: [number, number];
+  };
+  properties: DartLocationProperties;
+}
+
+/**
+ * GeoJSON FeatureCollection of DART station locations
+ */
+export interface DartLocationCollection {
+  type: 'FeatureCollection';
+  features: DartLocationFeature[];
+}
+
+/**
+ * A single DART observation for time series charting
+ */
+export interface DartObservation {
+  obs_time: string;
+  water_column_height_m: number;
+  measurement_type: number; // 1=15-min standard, 2=1-min event, 3=15-sec triggered
+  raw_text: string;
+}
+
+/**
+ * Fetch all DART station locations for placing markers on the map.
+ * Uses the /locations endpoint which returns station positions without observation data.
+ * Extracts station IDs from the URL-formatted id field.
+ */
+export async function fetchDartLocations(): Promise<DartLocationCollection> {
+  const baseUrl = getEdrBaseUrl();
+  const url = `${baseUrl}/edr/collections/dart/locations`;
+
+  console.log('[fetchDartLocations] Fetching:', url);
+
+  try {
+    const response = await authFetch(url);
+    if (!response.ok) {
+      console.error(`DART locations fetch failed: ${response.status} ${response.statusText}`);
+      return { type: 'FeatureCollection', features: [] };
+    }
+
+    const data = await response.json() as {
+      type: 'FeatureCollection';
+      features: Array<{
+        type: 'Feature';
+        id: string; // URL like "https://.../locations/21413"
+        geometry: { type: 'Point'; coordinates: [number, number] };
+        properties: { name: string; type: string };
+      }>;
+    };
+
+    // Extract station ID from URL-style id field and inject into properties
+    const features: DartLocationFeature[] = data.features.map((f) => {
+      const urlParts = f.id.split('/');
+      const stationId = urlParts[urlParts.length - 1];
+      return {
+        type: 'Feature' as const,
+        id: f.id,
+        geometry: f.geometry,
+        properties: {
+          location_id: stationId,
+          name: f.properties.name,
+          type: f.properties.type,
+        },
+      };
+    });
+
+    const result: DartLocationCollection = {
+      type: 'FeatureCollection',
+      features,
+    };
+
+    console.log(`[fetchDartLocations] Got ${features.length} stations`);
+    return result;
+  } catch (error) {
+    console.error('Error fetching DART locations:', error);
+    return { type: 'FeatureCollection', features: [] };
+  }
+}
+
+/**
+ * Fetch DART time series observations for a specific station.
+ * Returns observations sorted chronologically (oldest first).
+ *
+ * @param stationId - The DART station ID (e.g., "21413")
+ * @param days - Number of days of history to fetch (default 5)
+ * @param limit - Max observations to return (default 500)
+ */
+export async function fetchDartTimeSeries(
+  stationId: string,
+  days: number = 5,
+  limit: number = 500,
+): Promise<DartObservation[]> {
+  const baseUrl = getEdrBaseUrl();
+  const startDate = new Date();
+  startDate.setUTCDate(startDate.getUTCDate() - days);
+  const startIso = startDate.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  const url = `${baseUrl}/edr/collections/dart/locations/${stationId}?datetime=${startIso}/..&limit=${limit}`;
+
+  console.log(`[fetchDartTimeSeries] Fetching station ${stationId}:`, url);
+
+  try {
+    const response = await authFetch(url);
+    if (!response.ok) {
+      console.error(`DART time series fetch failed: ${response.status} ${response.statusText}`);
+      return [];
+    }
+
+    const data = await response.json() as {
+      type: 'FeatureCollection';
+      features: Array<{
+        properties: {
+          obs_time: string;
+          water_column_height_m?: number;
+          raw_text?: string;
+        };
+      }>;
+    };
+
+    const observations: DartObservation[] = [];
+    for (const f of data.features) {
+      const p = f.properties;
+      if (p.water_column_height_m == null) continue;
+
+      // Parse measurement type from raw_text: "T=1 HEIGHT=..." → 1
+      let mType = 1;
+      if (p.raw_text) {
+        const match = p.raw_text.match(/T=(\d)/);
+        if (match) mType = parseInt(match[1], 10);
+      }
+
+      observations.push({
+        obs_time: p.obs_time,
+        water_column_height_m: p.water_column_height_m,
+        measurement_type: mType,
+        raw_text: p.raw_text ?? '',
+      });
+    }
+
+    // Sort chronologically (oldest first) for charting
+    observations.sort((a, b) => a.obs_time.localeCompare(b.obs_time));
+
+    console.log(`[fetchDartTimeSeries] Station ${stationId}: ${observations.length} observations`);
+    return observations;
+  } catch (error) {
+    console.error(`Error fetching DART time series for ${stationId}:`, error);
+    return [];
+  }
+}
