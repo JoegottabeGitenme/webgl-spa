@@ -38,9 +38,12 @@ export interface LoadProgress {
   currentTimestamp: string;
 }
 
+export type FrameStatus = 'pending' | 'loading' | 'loaded' | 'error';
+
 export interface ProgressiveLoadCallbacks {
   onFrameLoaded?: (progress: LoadProgress, canStartPlayback: boolean) => void;
   onAllLoaded?: () => void;
+  onFrameStatusChange?: (datetime: string, status: FrameStatus) => void;
 }
 
 export class AnimationManager {
@@ -125,7 +128,13 @@ export class AnimationManager {
 
     const total = timestamps.length;
 
+    // Mark all frames as pending initially
+    for (const ts of timestamps) {
+      callbacks.onFrameStatusChange?.(ts, 'pending');
+    }
+
     const loadFrame = async (datetime: string): Promise<void> => {
+      callbacks.onFrameStatusChange?.(datetime, 'loading');
       try {
         const result = await fetchFn(datetime);
 
@@ -136,8 +145,10 @@ export class AnimationManager {
           height: result.height,
           metadata: result.metadata,
         });
+        callbacks.onFrameStatusChange?.(datetime, 'loaded');
       } catch (error) {
         console.error(`Failed to load frame for ${datetime}:`, error);
+        callbacks.onFrameStatusChange?.(datetime, 'error');
       }
     };
 

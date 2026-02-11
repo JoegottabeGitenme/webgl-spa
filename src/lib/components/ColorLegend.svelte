@@ -95,6 +95,9 @@
     if (units === 'K') {
       return preferredUnit === 'F' ? kelvinToFahrenheit(value) : kelvinToCelsius(value);
     }
+    if (units === 'Pa') {
+      return value / 100; // Pa -> hPa
+    }
     return value;
   }
 
@@ -102,11 +105,18 @@
     if (units === 'K') {
       return `°${preferredUnit}`;
     }
+    if (units === 'Pa') {
+      return ' hPa';
+    }
     return units;
   }
 
   function formatValue(value: number): string {
-    return convertValue(value).toFixed(0);
+    const converted = convertValue(value);
+    if (units === 'Pa') {
+      return converted.toFixed(0); // 1013 hPa, no decimals
+    }
+    return converted.toFixed(0);
   }
 
   // Get color stops with display values

@@ -1,0 +1,47 @@
+# =============================================================================
+# WebGL SPA - Production Dockerfile
+# =============================================================================
+# Multi-stage build:
+#   Stage 1: Node.js - Install dependencies and build the SvelteKit static app
+#   Stage 2: nginx:alpine - Serve static files
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Build
+# -----------------------------------------------------------------------------
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy source files
+COPY . .
+
+# Build the application (adapter-static outputs to build/)
+RUN npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2: Production
+# -----------------------------------------------------------------------------
+FROM nginx:alpine
+
+# Copy built assets to nginx html directory under /spa path
+COPY --from=builder /app/build /usr/share/nginx/html/spa
+
+# Copy nginx configuration
+COPY deploy/nginx.conf /etc/nginx/nginx.conf
+
+# Expose port 80
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost/spa/ || exit 1
+
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]

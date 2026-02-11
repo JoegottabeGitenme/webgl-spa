@@ -1,0 +1,30 @@
+# =============================================================================
+# WebGL SPA - Production Docker Compose
+# =============================================================================
+# Deploys the WebGL SPA on the shared-services network (gateway handles routing).
+# The app will be accessible via the main reverse proxy at /spa/
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+# =============================================================================
+
+services:
+  webgl-spa:
+    image: webgl-spa:latest
+    container_name: webgl-spa
+    restart: unless-stopped
+    networks:
+      - shared-services
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/spa/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "com.folkweather.service=webgl-spa"
+      - "com.folkweather.description=WebGL Weather SPA"
+
+networks:
+  shared-services:
+    external: true

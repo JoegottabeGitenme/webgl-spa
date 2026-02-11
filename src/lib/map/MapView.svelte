@@ -38,7 +38,7 @@
   } from "../visualization/color-scales";
   import ColorLegend from "../components/ColorLegend.svelte";
   import { WindParticleLayer, fetchWindData, type WindData } from "../wind";
-  import { AnimationManager, type LoadProgress, type ProgressiveLoadCallbacks } from "../animation";
+  import { AnimationManager, type LoadProgress, type FrameStatus, type ProgressiveLoadCallbacks } from "../animation";
   import { extractContours, contoursToGeoJSON, downsampleData } from "../isoline";
   import {
     type TileCoord,
@@ -268,6 +268,8 @@
   let collectionMeta = $state<CollectionMetadata | null>(null);
   // Animation frame timestamps (for showing loaded range)
   let animationFrameTimestamps = $state<string[]>([]);
+  // Per-frame load status for tick indicators on scrubber
+  let frameStatuses = $state<Map<string, FrameStatus>>(new Map());
 
   // Marker state
   interface TimeSeriesPoint {
@@ -729,6 +731,15 @@
     const units = getDataUnits();
     return units === 'K';
   }
+
+  /**
+   * Check if the current data is pressure in Pascals (PRMSL, PRES, MSLP, etc.)
+   * These need Pa -> hPa conversion for display (divide by 100)
+   */
+  function isPressureData(): boolean {
+    const units = getDataUnits();
+    return units === 'Pa';
+  }
   
   /**
    * Get the appropriate unit suffix for contour labels based on actual data units
@@ -738,6 +749,8 @@
     switch (units) {
       case 'K':
         return temperatureUnit === 'F' ? '°F' : '°C';
+      case 'Pa':
+        return ' hPa';
       case '%':
         return '%';
       case 'mm':
@@ -770,6 +783,13 @@
             ['to-string', ['round', ['-', ['get', 'level'], 273.15]]], 
             unit
           ];
+    } else if (isPressureData()) {
+      // Pressure data: convert from Pa to hPa (divide by 100)
+      // Round to 1 decimal for precision (e.g., 1013.2 hPa)
+      return ['concat', 
+        ['to-string', ['round', ['/', ['get', 'level'], 100]]], 
+        unit
+      ];
     } else {
       // Non-temperature data: display the raw value rounded
       return ['concat', 
@@ -790,6 +810,8 @@
         return temperatureUnit === 'F' 
           ? `${(isolineInterval * 1.8).toFixed(0)}°F` 
           : `${isolineInterval.toFixed(1)}°C`;
+      case 'Pa':
+        return `${(isolineInterval / 100).toFixed(0)} hPa`;
       case '%':
         return `${isolineInterval.toFixed(0)}%`;
       case 'mm':
@@ -829,6 +851,20 @@
           ? (displayLevel - 32) / 1.8 + 273.15
           : displayLevel + 273.15;
         levels.push(kelvinLevel);
+      }
+    } else if (isPressureData()) {
+      // Pressure data: work in hPa for nice round numbers, store as Pa
+      // isolineInterval is in Pa (e.g., 400 Pa = 4 hPa), display as hPa
+      const hPaMin = dataMin / 100;
+      const hPaMax = dataMax / 100;
+      const hPaInterval = Math.round(isolineInterval / 100);
+      const effectiveInterval = Math.max(1, hPaInterval); // At least 1 hPa
+      
+      // Snap to clean multiples of the hPa interval
+      const startHpa = Math.ceil(hPaMin / effectiveInterval) * effectiveInterval;
+      
+      for (let hpa = startHpa; hpa <= hPaMax; hpa += effectiveInterval) {
+        levels.push(hpa * 100); // Store as Pa for contour extraction
       }
     } else {
       // Non-temperature data: use values directly (humidity %, precipitation mm, etc.)
@@ -1052,6 +1088,14 @@
       displayUnitConfig = {
         unit: temperatureUnit,
         interval: Math.round(displayInterval)  // Round to nearest whole degree
+      };
+    } else if (isPressureData()) {
+      // Pressure data: isolineInterval is in Pa, snap to clean hPa multiples
+      // Use 'K' pass-through (no conversion), interval in Pa snapped to 100s (whole hPa)
+      const hPaInterval = Math.max(1, Math.round(isolineInterval / 100));
+      displayUnitConfig = {
+        unit: 'K',  // Pass-through (no unit conversion in extractContours)
+        interval: hPaInterval * 100  // Back to Pa, but snapped to whole hPa
       };
     } else {
       // Non-temperature data (humidity %, precipitation mm, etc.)
@@ -2531,6 +2575,8 @@
       cleanupAnimationSources();
       animationEnabled = false;
       animationActive = false;
+      animationFrameTimestamps = [];
+      frameStatuses = new Map();
       // Reload single frame
       await loadWeatherData();
     } else {
@@ -2574,6 +2620,8 @@
         animationMode
       );
       animationFrameTimestamps = timestamps;  // Store for UI display
+      // Initialize frame statuses as pending
+      frameStatuses = new Map(timestamps.map(ts => [ts, 'pending' as FrameStatus]));
 
       if (timestamps.length === 0) {
         throw new Error('No timestamps available for animation');
@@ -2629,6 +2677,10 @@
 
       // Progressive loading callbacks
       const progressiveCallbacks: ProgressiveLoadCallbacks = {
+        onFrameStatusChange: (datetime, status) => {
+          // Must create a new Map to trigger Svelte reactivity
+          frameStatuses = new Map(frameStatuses).set(datetime, status);
+        },
         onFrameLoaded: (progress, canStartPlayback) => {
           animationLoadProgress = progress;
 
@@ -3333,6 +3385,11 @@
       return `${value.toFixed(0)} dBZ`;
     }
 
+    // Handle Pascals -> hPa for pressure parameters
+    if (units === 'Pa') {
+      return `${(value / 100).toFixed(1)} hPa`;
+    }
+
     return `${value.toFixed(1)} ${units || ''}`;
   }
 
@@ -3990,6 +4047,20 @@
       </div>
       
       <div class="map-view__animation-scrubber">
+        {#if animationFrameTimestamps.length > 0}
+          <div class="map-view__scrubber-ticks">
+            {#each animationFrameTimestamps as ts, i}
+              {@const total = animationFrameTimestamps.length}
+              {@const pos = total <= 1 ? 50 : (i / (total - 1)) * 100}
+              {@const status = frameStatuses.get(ts) ?? 'pending'}
+              <div
+                class="map-view__scrubber-tick map-view__scrubber-tick--{status}"
+                style="left: {pos}%"
+                title="{formatDateCompact(ts)} ({status})"
+              ></div>
+            {/each}
+          </div>
+        {/if}
         <input
           type="range"
           min="0"
@@ -5512,6 +5583,50 @@
   .map-view__animation-scrubber {
     flex: 1;
     min-width: 200px;
+    position: relative;
+  }
+
+  .map-view__scrubber-ticks {
+    position: absolute;
+    top: 0;
+    left: 8px;    /* Half of slider thumb width to align with track */
+    right: 8px;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .map-view__scrubber-tick {
+    position: absolute;
+    top: 50%;
+    width: 3px;
+    height: 12px;
+    transform: translate(-50%, -50%);
+    border-radius: 1px;
+    transition: background-color 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .map-view__scrubber-tick--pending {
+    background: rgba(255, 255, 255, 0.15);
+  }
+
+  .map-view__scrubber-tick--loading {
+    background: rgba(78, 179, 211, 0.6);
+    box-shadow: 0 0 4px rgba(78, 179, 211, 0.4);
+    animation: tick-pulse 1s ease-in-out infinite;
+  }
+
+  .map-view__scrubber-tick--loaded {
+    background: rgba(129, 211, 78, 0.8);
+  }
+
+  .map-view__scrubber-tick--error {
+    background: rgba(239, 68, 68, 0.8);
+  }
+
+  @keyframes tick-pulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
   }
 
   .map-view__scrubber-input {
@@ -5521,19 +5636,21 @@
     appearance: none;
     background: transparent;
     cursor: pointer;
+    position: relative;
+    z-index: 2;
   }
 
   .map-view__scrubber-input::-webkit-slider-runnable-track {
     width: 100%;
     height: 6px;
-    background: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.12);
     border-radius: 3px;
   }
 
   .map-view__scrubber-input::-moz-range-track {
     width: 100%;
     height: 6px;
-    background: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.12);
     border-radius: 3px;
   }
 

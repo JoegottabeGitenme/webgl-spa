@@ -116,6 +116,22 @@ export const PARAMETER_SCALES: Record<string, ParameterScale> = {
     unit: 'Pa',
     name: 'Mean Sea Level Pressure',
   },
+
+  // MSLP alias (some models use this instead of PRMSL)
+  MSLP: {
+    min: 87000,
+    max: 108000,
+    unit: 'Pa',
+    name: 'Mean Sea Level Pressure',
+  },
+
+  // MSLET - Mean Sea Level Pressure (ETA model reduction)
+  MSLET: {
+    min: 87000,
+    max: 108000,
+    unit: 'Pa',
+    name: 'Mean Sea Level Pressure (ETA)',
+  },
   
   // Cloud Cover (percent)
   TCDC: {

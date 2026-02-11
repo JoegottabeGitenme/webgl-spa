@@ -12,5 +12,6 @@ export {
   type FrameLoadFn,
   type WindFrameLoadFn,
   type LoadProgress,
+  type FrameStatus,
   type ProgressiveLoadCallbacks,
 } from './AnimationManager';
