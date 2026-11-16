@@ -427,8 +427,47 @@
     }
   });
 
-  // Carto Dark Matter basemap
-  const BASEMAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+  // OpenFreeMap dark basemap (free, no API key; OpenMapTiles schema).
+  // The style's TileJSON carries the required OpenFreeMap / OpenMapTiles / OSM attribution,
+  // which MapLibre's default attribution control displays.
+  const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/dark";
+
+  // Glyph font for our own symbol layers. OpenFreeMap's glyph server only has Noto Sans
+  // Regular/Bold/Italic and does not serve multi-font stacks, so use a single font name.
+  const LABEL_FONT = ['Noto Sans Bold'];
+
+  // The weather raster is drawn over the basemap at 0.75 opacity, so only a quarter of the
+  // basemap's contrast shows through. OpenFreeMap dark is much lower-contrast than the old
+  // CARTO Dark Matter (water, borders and place labels are near-black/grey), so lift the
+  // layers that matter for orientation (coastlines, borders, place names) back to roughly
+  // the old values, and hide the scattered road-number shields, which just add noise.
+  // Layer ids are those of the OpenFreeMap dark style; each is guarded so a style change
+  // on their side degrades to the stock look rather than throwing.
+  function applyBasemapContrast() {
+    if (!map) return;
+    const paint = (id: string, prop: string, value: string) => {
+      if (map!.getLayer(id)) map!.setPaintProperty(id, prop, value);
+    };
+    paint('water', 'fill-color', '#2C353C');
+    paint('boundary_state', 'line-color', 'rgb(103,103,114)');
+    paint('boundary_country_z0-4', 'line-color', 'rgb(102,102,102)');
+    paint('boundary_country_z5-', 'line-color', 'rgb(102,102,102)');
+    for (const id of [
+      'place_other', 'place_suburb', 'place_village', 'place_town', 'place_city',
+      'place_city_large', 'place_state', 'place_country_other', 'place_country_minor',
+      'place_country_major',
+    ]) {
+      paint(id, 'text-color', 'rgb(205,215,225)');
+    }
+    for (const id of ['highway_name_motorway', 'highway_name_other']) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', 'none');
+    }
+    // The style asks for the icon 'circle-11', but OpenFreeMap's sprite names it 'circle_11', so the
+    // city and town dots (which CARTO drew) are missing; point the place layers at the sprite's name.
+    for (const id of ['place_town', 'place_city', 'place_city_large']) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, 'icon-image', ['step', ['zoom'], 'circle_11', 9, '']);
+    }
+  }
   
   // Weather layer source/layer IDs
   const WEATHER_SOURCE_ID = 'weather-data';
@@ -1214,7 +1253,7 @@
           'symbol-spacing': 250,
           'text-field': textFieldExpression,
           'text-size': contourLabelSize,
-          'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+          'text-font': LABEL_FONT,
           'text-rotation-alignment': 'viewport',  // Keep text upright
           'text-keep-upright': true,              // Flip text to stay readable
           'text-pitch-alignment': 'viewport',
@@ -1832,6 +1871,7 @@
     }
 
     map.on("style.load", async () => {
+      applyBasemapContrast();
       await loadWeatherData();
       // Only listen for move events if not in compact mode
       if (!compact) {
@@ -2813,7 +2853,7 @@
         'text-allow-overlap': false,
         'text-ignore-placement': false,
         'text-optional': true,
-        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-font': LABEL_FONT,
       },
       paint: {
         'text-color': '#ffffff',
@@ -3079,7 +3119,7 @@
         'text-allow-overlap': false,
         'text-ignore-placement': false,
         'text-optional': true,
-        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-font': LABEL_FONT,
       },
       paint: {
         'text-color': '#b2ebf2',
@@ -3413,7 +3453,7 @@
         'text-allow-overlap': false,
         'text-ignore-placement': false,
         'text-optional': true,
-        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-font': LABEL_FONT,
       },
       paint: {
         'text-color': '#e8d5b7',
@@ -3792,7 +3832,7 @@
         'text-allow-overlap': false,
         'text-ignore-placement': false,
         'text-optional': true,
-        'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+        'text-font': LABEL_FONT,
       },
       paint: {
         'text-color': '#85c1e9',
@@ -5873,6 +5913,26 @@
 
   .map-view__container :global(.maplibregl-map) {
     font-family: inherit;
+  }
+
+  /* Keep the basemap attribution (required by OpenFreeMap) clear of the bottom-centre UI.
+     The animation bar is centred, ~714px wide, bottom 16px and ~56px tall; the temporal info
+     strip sits just above it (bottom ~68px, ~48px tall) and grows wider once animation
+     frames are loaded. Above ~1560px wide the credit no longer overlaps the bar, so only
+     lift it on narrower viewports: first above the bar, then (below ~1500px, where the strip
+     can reach it) above the strip too. z-index keeps the credit on top if the strip wraps or
+     its runs list is expanded. */
+  @media (max-width: 1560px) {
+    .map-view__container :global(.maplibregl-ctrl-bottom-right) {
+      bottom: 72px;
+      z-index: 11;
+    }
+  }
+
+  @media (max-width: 1500px) {
+    .map-view__container :global(.maplibregl-ctrl-bottom-right) {
+      bottom: 124px;
+    }
   }
 
   /* Marker styles (global since MapLibre creates these elements) */

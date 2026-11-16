@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Color legend editor redesigned with larger visual slider (700px wide, 48px track)
 - Color scale now uses absolute temperature range mapping instead of relative data range
+- Basemap moved from CARTO Dark Matter (now requires an API key) to OpenFreeMap dark (free, no key); label layers (contours, METAR, buoys, TAF, DART) now use Noto Sans Bold, the font OpenFreeMap serves
 
 ## [1.0.0-beta] - 2026-01-24
 
